@@ -1,0 +1,7 @@
+customer_id: CustomerID
+transaction_id: InvoiceNo
+event_time: InvoiceDate
+amount: Revenue
+item_id: StockCode
+quantity: Quantity
+country: Country

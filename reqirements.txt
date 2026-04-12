@@ -1,0 +1,8 @@
+catboost
+scikit-learn
+lightgbm
+shap
+streamlit
+requests
+fastapi
+openpyxl

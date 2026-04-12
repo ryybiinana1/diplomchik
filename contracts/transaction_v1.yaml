@@ -1,0 +1,33 @@
+version: "1.0"
+dataset: "transactions"
+owner: "customer-analytics"
+description: "Transaction events for churn/retention modeling"
+
+schema:
+  - name: customer_id
+    type: string
+    required: true
+  - name: transaction_id
+    type: string
+    required: true
+  - name: event_time
+    type: datetime
+    required: true
+  - name: amount
+    type: float
+    required: true
+  - name: item_id
+    type: string
+    required: false
+  - name: quantity
+    type: integer
+    required: false
+  - name: country
+    type: string
+    required: false
+  - name: is_cancellation
+    type: boolean
+    required: false
+  - name: promo_code
+    type: string
+    required: false

@@ -1,0 +1,21 @@
+version: "1.0"
+dataset: "events"
+owner: "customer-analytics"
+description: "User activity events for churn/retention modeling"
+
+schema:
+  - name: subject_id
+    type: string
+    required: true
+  - name: event_time
+    type: datetime
+    required: true
+  - name: event_name
+    type: string
+    required: true
+  - name: account_id
+    type: string
+    required: false
+  - name: platform
+    type: string
+    required: false

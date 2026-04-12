@@ -1,0 +1,23 @@
+[project]
+name = "churn-service"
+version = "0.1.0"
+description = "Self-serve churn/retention service"
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "matplotlib",
+    "joblib",
+    "lightgbm",
+    "catboost",
+    "shap",
+    "streamlit",
+    "requests",
+    "pyyaml",
+    "openpyxl",
+]

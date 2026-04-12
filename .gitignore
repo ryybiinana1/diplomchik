@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Tests / cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Artifacts and outputs
+outputs/
+data/
+models/
+artifacts/
+bundle/
+
+# Serialized models / datasets
+*.parquet
+*.pkl
+*.joblib
+*.zip
+
+# Logs / temp
+*.log
+tmp/
+temp/
+*.tmp

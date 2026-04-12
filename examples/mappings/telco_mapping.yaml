@@ -1,0 +1,5 @@
+account_id: customerID
+period_start: period_start
+period_end: period_end
+mrr: MonthlyCharges
+subscription_status: subscription_status

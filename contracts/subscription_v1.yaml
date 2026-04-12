@@ -1,0 +1,34 @@
+version: "1.0"
+dataset: "subscriptions"
+owner: "customer-analytics"
+description: "Subscription billing data for churn/retention modeling"
+
+schema:
+  - name: account_id
+    type: string
+    required: true
+  - name: period_start
+    type: date
+    required: true
+  - name: period_end
+    type: date
+    required: true
+  - name: mrr
+    type: float
+    required: true
+  - name: subscription_status
+    type: enum
+    required: true
+    allowed_values: ["active", "canceled", "past_due"]
+  - name: churn_date
+    type: date
+    required: false
+  - name: plan_name
+    type: string
+    required: false
+  - name: seats_purchased
+    type: integer
+    required: false
+  - name: seats_used
+    type: integer
+    required: false
