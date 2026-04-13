@@ -1,87 +1,64 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Dict
-import pandas as pd
-
-
-def write_model_card(
-    template: str,
-    horizon_days: int,
-    history_days: int,
-    metrics_raw: Dict,
-    metrics_cal: Dict,
-    out_path: str | Path,
-) -> None:
-    out_path = Path(out_path)
-
-    text = f"""# Model Card
-
-## Overview
-- Task: churn / retention scoring
-- Template: `{template}`
-- Horizon H: `{horizon_days}` days
-- History window W: `{history_days}` days
-
-## Intended use
-This model is intended for prioritizing customers/accounts/users for retention analysis or campaigns.
-
-## Training/evaluation setup
-- Time-aware split
-- Walk-forward CV
-- Probability calibration enabled
-
-## Metrics (raw model)
-- ROC-AUC: {metrics_raw.get("roc_auc")}
-- PR-AUC: {metrics_raw.get("pr_auc")}
-- Brier: {metrics_raw.get("brier")}
-
-## Metrics (calibrated probabilities)
-- ROC-AUC: {metrics_cal.get("roc_auc")}
-- PR-AUC: {metrics_cal.get("pr_auc")}
-- Brier: {metrics_cal.get("brier")}
-
-## Limitations
-- This is not uplift modeling.
-- Probability quality depends on calibration and data stability.
-- Distribution shift / concept drift may reduce quality over time.
-- Recommended to retrain periodically and monitor drift.
-
-## Ethical / business notes
-- Scores should support decision-making, not replace domain judgment.
-- Avoid using direct PII as model features unless governance explicitly allows it.
-"""
-    out_path.write_text(text, encoding="utf-8")
+from typing import Any, Dict, List
 
 
 def write_datasheet(
-    df_raw: pd.DataFrame,
+    df,
     template: str,
-    out_path: str | Path,
-) -> None:
-    out_path = Path(out_path)
+    out_path: str,
+    extra: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
 
-    lines = [
-        "# Datasheet",
-        "",
-        f"## Dataset template",
-        f"- Template: `{template}`",
-        f"- Rows: `{len(df_raw)}`",
-        f"- Columns: `{len(df_raw.columns)}`",
-        "",
-        "## Columns",
-    ]
+    payload = {
+        "template": template,
+        "n_rows": int(len(df)),
+        "n_cols": int(df.shape[1]),
+        "columns": list(df.columns),
+        "dtypes": {k: str(v) for k, v in df.dtypes.to_dict().items()},
+        "null_share": df.isna().mean().round(6).to_dict(),
+        "duplicates_full_rows": int(df.duplicated().sum()),
+        "extra": extra or {},
+    }
 
-    for col in df_raw.columns:
-        dtype = str(df_raw[col].dtype)
-        nulls = int(df_raw[col].isna().sum())
-        lines.append(f"- `{col}`: dtype={dtype}, nulls={nulls}")
+    out.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {"datasheet_path": str(out)}
 
-    lines += [
-        "",
-        "## Notes",
-        "- This datasheet is auto-generated from the uploaded raw file.",
-        "- Review missing values, business definitions, and collection process before production use.",
-    ]
 
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+def write_model_card(
+    out_path: str,
+    template: str | None = None,
+    metrics: Dict[str, Any] | None = None,
+    params: Dict[str, Any] | None = None,
+    params_used: Dict[str, Any] | None = None,
+    suitability: Dict[str, Any] | None = None,
+    extra_feature_audit: List[Dict[str, Any]] | None = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    if params is None:
+        params = params_used or {}
+
+    payload = {
+        "template": template,
+        "metrics": metrics or {},
+        "params": params,
+        "suitability": suitability or {},
+        "extra_feature_audit": extra_feature_audit or [],
+        "extra": kwargs,
+    }
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return {"model_card_path": str(out)}

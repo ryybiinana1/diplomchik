@@ -1,190 +1,238 @@
+# churnlib/validation_module.py
 from __future__ import annotations
 
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 import pandas as pd
 
 
-REQUIRED_COLUMNS: Dict[str, List[str]] = {
-    "transactions": ["customer_id", "transaction_id", "event_time", "amount"],
-    "subscriptions": ["account_id", "period_start", "period_end", "mrr", "subscription_status"],
-    "events": ["subject_id", "event_time", "event_name"],
-}
-
-
-DATE_COLUMNS: Dict[str, List[str]] = {
-    "transactions": ["event_time"],
-    "subscriptions": ["period_start", "period_end", "churn_date"],
-    "events": ["event_time"],
-}
-
-
-def _check_required_columns(df: pd.DataFrame, template: str) -> None:
-    required = REQUIRED_COLUMNS.get(template)
-    if required is None:
+def basic_validate(df: pd.DataFrame, template: str) -> None:
+    if template == "transactions":
+        required = ["customer_id", "transaction_id", "event_time", "amount"]
+    elif template == "subscriptions":
+        required = ["account_id", "period_start", "period_end", "mrr", "subscription_status"]
+    elif template == "events":
+        required = ["subject_id", "event_time", "event_name"]
+    else:
         raise ValueError(f"Unknown template: {template}")
 
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"Missing required columns for template='{template}': {missing}. "
-            f"Present columns: {list(df.columns)}"
-        )
+        raise ValueError(f"Missing required columns: {missing}")
 
-
-def _check_non_empty(df: pd.DataFrame) -> None:
-    if df.empty:
-        raise ValueError("Input dataframe is empty.")
+    # базовая проверка на nulls в required
+    null_req = [c for c in required if df[c].isna().mean() > 0.5]
+    if null_req:
+        raise ValueError(f"Too many nulls in required columns: {null_req}")
 
 
 def profile_dataset(df: pd.DataFrame, template: str) -> Dict[str, Any]:
-    report: Dict[str, Any] = {
+    df = df.copy()
+
+    out: Dict[str, Any] = {
         "template": template,
         "n_rows": int(len(df)),
-        "n_cols": int(len(df.columns)),
-        "columns": list(df.columns),
-        "duplicates_full_rows": int(df.duplicated().sum()),
-        "nulls_by_column": {},
-        "null_share_by_column": {},
-        "date_ranges": {},
-        "warnings": [],
+        "n_cols": int(df.shape[1]),
+        "duplicate_rows": int(df.duplicated().sum()),
+        "null_share_overall": float(df.isna().mean().mean()) if df.shape[1] else 0.0,
+        "null_share_by_column": {c: float(df[c].isna().mean()) for c in df.columns},
+        "dtypes": {c: str(df[c].dtype) for c in df.columns},
     }
 
-    for col in df.columns:
-        nulls = int(df[col].isna().sum())
-        report["nulls_by_column"][col] = nulls
-        report["null_share_by_column"][col] = float(nulls / max(len(df), 1))
+    if template == "transactions" and {"event_time", "customer_id", "transaction_id", "amount"}.issubset(df.columns):
+        df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
+        df["customer_id"] = df["customer_id"].astype(str)
+        df["transaction_id"] = df["transaction_id"].astype(str)
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
-    for col in DATE_COLUMNS.get(template, []):
-        if col in df.columns:
-            parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
-            valid = parsed.dropna()
-            report["date_ranges"][col] = {
-                "parseable_share": float(valid.shape[0] / max(len(df), 1)),
-                "min": str(valid.min()) if not valid.empty else None,
-                "max": str(valid.max()) if not valid.empty else None,
-                "invalid_count": int(parsed.isna().sum()),
+        tmin = df["event_time"].min()
+        tmax = df["event_time"].max()
+        span_days = (tmax - tmin).days if pd.notna(tmin) and pd.notna(tmax) else None
+
+        out.update(
+            {
+                "time_min": str(tmin) if pd.notna(tmin) else None,
+                "time_max": str(tmax) if pd.notna(tmax) else None,
+                "time_span_days": int(span_days) if span_days is not None else None,
+                "n_customers": int(df["customer_id"].nunique()),
+                "n_transactions": int(df["transaction_id"].nunique()),
             }
-
-    # template-specific light checks
-    if template == "transactions":
-        if "customer_id" in df.columns:
-            report["unique_customers"] = int(df["customer_id"].nunique(dropna=True))
-        if "transaction_id" in df.columns:
-            report["unique_transactions"] = int(df["transaction_id"].nunique(dropna=True))
-        if "amount" in df.columns:
-            amt = pd.to_numeric(df["amount"], errors="coerce")
-            report["amount_stats"] = {
-                "min": float(amt.min()) if amt.notna().any() else None,
-                "max": float(amt.max()) if amt.notna().any() else None,
-                "non_numeric_count": int(amt.isna().sum()),
-                "non_positive_count": int((amt <= 0).sum()) if amt.notna().any() else 0,
-            }
-
-    elif template == "subscriptions":
-        if "account_id" in df.columns:
-            report["unique_accounts"] = int(df["account_id"].nunique(dropna=True))
-        if "subscription_status" in df.columns:
-            report["status_counts"] = df["subscription_status"].astype(str).value_counts(dropna=False).to_dict()
-
-    elif template == "events":
-        if "subject_id" in df.columns:
-            report["unique_subjects"] = int(df["subject_id"].nunique(dropna=True))
-        if "event_name" in df.columns:
-            report["event_name_top"] = df["event_name"].astype(str).value_counts(dropna=False).head(20).to_dict()
-
-    # warnings
-    if len(df) < 100:
-        report["warnings"].append("Очень мало строк: модель может быть нестабильной.")
-    if report["duplicates_full_rows"] > 0:
-        report["warnings"].append("Есть полные дубликаты строк.")
-    for col, share in report["null_share_by_column"].items():
-        if share > 0.3:
-            report["warnings"].append(f"Колонка '{col}' содержит более 30% пропусков.")
-
-    return report
-
-
-def _check_transactions(df: pd.DataFrame) -> None:
-    if df["customer_id"].isna().any():
-        raise ValueError("transactions: customer_id contains nulls")
-    if df["transaction_id"].isna().any():
-        raise ValueError("transactions: transaction_id contains nulls")
-    if df["event_time"].isna().any():
-        raise ValueError("transactions: event_time contains nulls")
-    if df["amount"].isna().any():
-        raise ValueError("transactions: amount contains nulls")
-
-    parsed_time = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
-    if parsed_time.isna().any():
-        bad_n = int(parsed_time.isna().sum())
-        raise ValueError(f"transactions: event_time contains {bad_n} unparsable values")
-
-    parsed_amount = pd.to_numeric(df["amount"], errors="coerce")
-    if parsed_amount.isna().any():
-        bad_n = int(parsed_amount.isna().sum())
-        raise ValueError(f"transactions: amount contains {bad_n} non-numeric values")
-
-    if (parsed_amount <= 0).all():
-        raise ValueError("transactions: all amount values are <= 0")
-
-    now_utc = pd.Timestamp.now(tz="UTC")
-    if parsed_time.max() > now_utc + pd.Timedelta(days=1):
-        raise ValueError("transactions: event_time contains future timestamps")
-
-
-def _check_subscriptions(df: pd.DataFrame) -> None:
-    for col in ["period_start", "period_end"]:
-        parsed = pd.to_datetime(df[col], errors="coerce")
-        if parsed.isna().any():
-            bad_n = int(parsed.isna().sum())
-            raise ValueError(f"subscriptions: {col} contains {bad_n} unparsable values")
-
-    parsed_mrr = pd.to_numeric(df["mrr"], errors="coerce")
-    if parsed_mrr.isna().any():
-        bad_n = int(parsed_mrr.isna().sum())
-        raise ValueError(f"subscriptions: mrr contains {bad_n} non-numeric values")
-    if (parsed_mrr < 0).any():
-        raise ValueError("subscriptions: mrr contains negative values")
-
-    allowed = {"active", "canceled", "past_due"}
-    bad = set(df["subscription_status"].astype(str).str.lower().unique()) - allowed
-    if bad:
-        raise ValueError(
-            f"subscriptions: subscription_status contains invalid values: {sorted(bad)}. "
-            f"Allowed: {sorted(allowed)}"
         )
 
-    period_start = pd.to_datetime(df["period_start"], errors="coerce")
-    period_end = pd.to_datetime(df["period_end"], errors="coerce")
-    if (period_end < period_start).any():
-        raise ValueError("subscriptions: found rows where period_end < period_start")
+        per_cust = df.groupby("customer_id")["transaction_id"].count()
+        out["tx_per_customer"] = {
+            "mean": float(per_cust.mean()) if len(per_cust) else None,
+            "median": float(per_cust.median()) if len(per_cust) else None,
+            "p90": float(per_cust.quantile(0.9)) if len(per_cust) else None,
+            "share_customers_1_tx": float((per_cust <= 1).mean()) if len(per_cust) else None,
+            "share_customers_2plus_tx": float((per_cust >= 2).mean()) if len(per_cust) else None,
+        }
+
+    if template == "subscriptions" and {"account_id", "period_end", "mrr", "subscription_status"}.issubset(df.columns):
+        df["account_id"] = df["account_id"].astype(str)
+        df["period_end"] = pd.to_datetime(df["period_end"], errors="coerce")
+        df["mrr"] = pd.to_numeric(df["mrr"], errors="coerce")
+
+        tmin = df["period_end"].min()
+        tmax = df["period_end"].max()
+        span_days = (tmax - tmin).days if pd.notna(tmin) and pd.notna(tmax) else None
+
+        out.update(
+            {
+                "time_min": str(tmin) if pd.notna(tmin) else None,
+                "time_max": str(tmax) if pd.notna(tmax) else None,
+                "time_span_days": int(span_days) if span_days is not None else None,
+                "n_accounts": int(df["account_id"].nunique()),
+                "status_counts": df["subscription_status"].value_counts(dropna=False).to_dict(),
+            }
+        )
+
+    if template == "events" and {"subject_id", "event_time", "event_name"}.issubset(df.columns):
+        df["subject_id"] = df["subject_id"].astype(str)
+        df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
+
+        tmin = df["event_time"].min()
+        tmax = df["event_time"].max()
+        span_days = (tmax - tmin).days if pd.notna(tmin) and pd.notna(tmax) else None
+
+        out.update(
+            {
+                "time_min": str(tmin) if pd.notna(tmin) else None,
+                "time_max": str(tmax) if pd.notna(tmax) else None,
+                "time_span_days": int(span_days) if span_days is not None else None,
+                "n_subjects": int(df["subject_id"].nunique()),
+                "n_events": int(len(df)),
+            }
+        )
+
+    return out
 
 
-def _check_events(df: pd.DataFrame) -> None:
-    if df["subject_id"].isna().any():
-        raise ValueError("events: subject_id contains nulls")
-    if df["event_name"].isna().any():
-        raise ValueError("events: event_name contains nulls")
+def assess_suitability(
+    df: pd.DataFrame,
+    template: str,
+    params: Optional[Dict[str, Any]] = None,
+    horizons: List[int] | None = None,
+) -> Dict[str, Any]:
+    """
+    Вердикт пригодности данных для churn‑обучения.
+    Это НЕ “истина”, а продуктовая диагностика с чёткими причинами.
+    """
+    params = params or {}
+    horizons = horizons or [30, 60, 90]
 
-    parsed_time = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
-    if parsed_time.isna().any():
-        bad_n = int(parsed_time.isna().sum())
-        raise ValueError(f"events: event_time contains {bad_n} unparsable values")
+    history_days = int(params.get("history_days", 180))
+    step_days = int(params.get("step_days", 30))
 
-    now_utc = pd.Timestamp.now(tz="UTC")
-    if parsed_time.max() > now_utc + pd.Timedelta(days=1):
-        raise ValueError("events: event_time contains future timestamps")
-
-
-def basic_validate(df: pd.DataFrame, template: str) -> None:
-    _check_non_empty(df)
-    _check_required_columns(df, template)
+    verdict = "ready"
+    reasons: List[str] = []
+    horizon_checks: Dict[str, Any] = {}
 
     if template == "transactions":
-        _check_transactions(df)
-    elif template == "subscriptions":
-        _check_subscriptions(df)
+        if "event_time" not in df.columns or "customer_id" not in df.columns:
+            return {"verdict": "not_recommended", "reasons": ["Не хватает обязательных колонок для транзакционного шаблона."], "horizons": {}}
+
+        d = df.copy()
+        d["event_time"] = pd.to_datetime(d["event_time"], errors="coerce", utc=True)
+        d["customer_id"] = d["customer_id"].astype(str)
+
+        tmin = d["event_time"].min()
+        tmax = d["event_time"].max()
+        if pd.isna(tmin) or pd.isna(tmax):
+            return {"verdict": "not_recommended", "reasons": ["Не удалось распознать даты операций (event_time)."], "horizons": {}}
+
+        span_days = int((tmax - tmin).days)
+        n_customers = int(d["customer_id"].nunique())
+
+        per_cust = d.groupby("customer_id").size()
+        share_2plus = float((per_cust >= 2).mean()) if len(per_cust) else 0.0
+
+        if n_customers < 100:
+            verdict = "partial"
+            reasons.append(f"Слишком мало клиентов для устойчивого обучения: {n_customers} (желательно ≥ 100).")
+
+        if span_days < (history_days + min(horizons)):
+            verdict = "partial"
+            reasons.append(
+                f"Недостаточно истории: всего {span_days} дней, а для базового окна {history_days} + горизонта ≥{min(horizons)} нужно больше."
+            )
+
+        if share_2plus < 0.15:
+            verdict = "partial"
+            reasons.append(
+                f"Слишком мало повторных покупок: доля клиентов с ≥2 покупками = {share_2plus:.1%}. Модели сложнее ловить паттерн оттока."
+            )
+
+        for h in horizons:
+            feasible = span_days >= (history_days + h)
+            # "labelable" — у клиента есть активность не позже, чем tmax-h (иначе “будущего окна” нет)
+            cutoff = (tmax - pd.Timedelta(days=h))
+            labelable = d.loc[d["event_time"] <= cutoff, "customer_id"].nunique()
+            labelable_share = float(labelable / max(n_customers, 1))
+            horizon_checks[str(h)] = {
+                "feasible_by_span": bool(feasible),
+                "labelable_customers_share": labelable_share,
+                "cutoff_date": str(cutoff),
+            }
+
+        if verdict == "partial" and any(not v["feasible_by_span"] for v in horizon_checks.values()):
+            reasons.append("Часть горизонтов недоступна из-за короткого периода данных.")
+
+        if not reasons:
+            reasons.append("Данные выглядят пригодными для обучения при выбранных окнах/горизонтах.")
+
+        return {
+            "verdict": verdict,
+            "reasons": reasons,
+            "metrics": {
+                "time_span_days": span_days,
+                "n_customers": n_customers,
+                "share_customers_2plus_tx": share_2plus,
+                "history_days": history_days,
+                "step_days": step_days,
+            },
+            "horizons": horizon_checks,
+        }
+
+    # Для subscriptions и events делаем более мягкий вердикт (пока проще)
+    d = df.copy()
+    if template == "subscriptions":
+        key = "account_id"
+        time_col = "period_end"
     elif template == "events":
-        _check_events(df)
+        key = "subject_id"
+        time_col = "event_time"
     else:
-        raise ValueError(f"Unknown template: {template}")
+        return {"verdict": "not_recommended", "reasons": ["Неизвестный шаблон данных."], "horizons": {}}
+
+    if key not in d.columns or time_col not in d.columns:
+        return {"verdict": "not_recommended", "reasons": ["Не хватает обязательных колонок для выбранного шаблона."], "horizons": {}}
+
+    d[key] = d[key].astype(str)
+    d[time_col] = pd.to_datetime(d[time_col], errors="coerce", utc=True)
+
+    tmin = d[time_col].min()
+    tmax = d[time_col].max()
+    if pd.isna(tmin) or pd.isna(tmax):
+        return {"verdict": "not_recommended", "reasons": ["Проблема с распознаванием дат."], "horizons": {}}
+
+    span_days = int((tmax - tmin).days)
+    n_entities = int(d[key].nunique())
+
+    if n_entities < 100:
+        verdict = "partial"
+        reasons.append(f"Сущностей слишком мало: {n_entities}.")
+    if span_days < (history_days + min(horizons)):
+        verdict = "partial"
+        reasons.append(f"Период данных {span_days} дней — вероятно маловат для стабильной модели.")
+
+    if not reasons:
+        reasons.append("Данные выглядят пригодными для обучения (базовая проверка).")
+
+    return {
+        "verdict": verdict,
+        "reasons": reasons,
+        "metrics": {"time_span_days": span_days, "n_entities": n_entities, "history_days": history_days, "step_days": step_days},
+        "horizons": {},
+    }

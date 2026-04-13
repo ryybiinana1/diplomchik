@@ -13,25 +13,51 @@ class JobStore:
 
     def new_job(self) -> str:
         job_id = str(uuid.uuid4())
-        (self.base / job_id).mkdir(parents=True, exist_ok=True)
-        (self.base / job_id / "raw").mkdir(exist_ok=True)
-        (self.base / job_id / "run").mkdir(exist_ok=True)
-        (self.base / job_id / "artifacts").mkdir(exist_ok=True)
+        job_dir = self.base / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "raw").mkdir(exist_ok=True)
+        (job_dir / "run").mkdir(exist_ok=True)
+        (job_dir / "artifacts").mkdir(exist_ok=True)
         self.write_status(job_id, {"status": "created"})
         return job_id
 
     def job_dir(self, job_id: str) -> Path:
         return self.base / job_id
 
-    def write_status(self, job_id: str, payload: Dict):
-        p = self.job_dir(job_id) / "status.json"
-        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    def write_status(self, job_id: str, payload: Dict) -> None:
+        job_dir = self.job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        target = job_dir / "status.json"
+        tmp = job_dir / "status.json.tmp"
+
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(target)
 
     def read_status(self, job_id: str) -> Dict:
         p = self.job_dir(job_id) / "status.json"
+
         if not p.exists():
-            return {"status": "unknown"}
-        return json.loads(p.read_text(encoding="utf-8"))
+            return {"status": "unknown", "job_id": job_id}
+
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {
+                "status": "running",
+                "job_id": job_id,
+                "stage": "updating_status",
+                "progress": None,
+            }
+        except Exception as e:
+            return {
+                "status": "failed",
+                "job_id": job_id,
+                "error": f"read_status_failed: {e}",
+            }
 
     def list_jobs(self) -> List[Dict]:
         rows: List[Dict] = []
@@ -40,18 +66,19 @@ class JobStore:
                 continue
             job_id = p.name
             status = self.read_status(job_id)
-            rows.append({
-                "job_id": job_id,
-                "status": status.get("status"),
-                "stage": status.get("stage"),
-                "progress": status.get("progress"),
-                "result": status.get("result"),
-            })
+            rows.append(
+                {
+                    "job_id": job_id,
+                    "status": status.get("status"),
+                    "stage": status.get("stage"),
+                    "progress": status.get("progress"),
+                    "result": status.get("result"),
+                }
+            )
         return rows
 
     def list_model_bundles(self) -> List[Dict]:
         rows: List[Dict] = []
-
         for p in sorted(self.base.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
             if not p.is_dir():
                 continue
@@ -59,6 +86,7 @@ class JobStore:
             job_id = p.name
             status = self.read_status(job_id)
             result = status.get("result", {})
+
             if status.get("status") != "done":
                 continue
 
@@ -70,7 +98,7 @@ class JobStore:
 
             if not bundle_dir:
                 try:
-                    bundle_candidate = result.get("artifacts", {}).get("bundle", {}).get("bundle_dir")
+                    bundle_candidate = result.get("artifacts", {}).get("bundle_dir")
                     if bundle_candidate and Path(bundle_candidate).exists():
                         bundle_dir = Path(bundle_candidate)
                 except Exception:
@@ -79,14 +107,14 @@ class JobStore:
             if not bundle_dir:
                 continue
 
-            rows.append({
-                "job_id": job_id,
-                "bundle_dir": str(bundle_dir),
-                "status": status.get("status"),
-                "template": result.get("template"),
-                "params_used": result.get("params_used", {}),
-                "test_metrics_cal": result.get("test_metrics_cal", {}),
-                "business_metrics": result.get("business_metrics", {}),
-            })
-
+            rows.append(
+                {
+                    "job_id": job_id,
+                    "bundle_dir": str(bundle_dir),
+                    "status": status.get("status"),
+                    "template": result.get("template"),
+                    "params_used": result.get("params_used", {}),
+                    "test_metrics": result.get("test_metrics", {}),
+                }
+            )
         return rows

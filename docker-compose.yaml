@@ -7,6 +7,8 @@ services:
       - "8000:8000"
     volumes:
       - ./outputs:/app/outputs
+      - ./app:/app/app
+      - ./churnlib:/app/churnlib
 
   ui:
     build:
@@ -18,3 +20,6 @@ services:
       - API_URL=http://api:8000
     depends_on:
       - api
+    volumes:
+      - ./ui:/app/ui
+      - ./app:/app/app

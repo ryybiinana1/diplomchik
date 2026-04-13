@@ -1,9 +1,14 @@
 FROM python:3.11-slim
 
-WORKDIR /ui
-RUN pip install --no-cache-dir -U pip
-RUN pip install --no-cache-dir streamlit requests
+WORKDIR /app
 
-COPY ui/streamlit_app.py /ui/streamlit_app.py
+COPY reqirements.txt /app/reqirements.txt
+RUN pip install --no-cache-dir -r /app/reqirements.txt
+
+COPY . /app
+
+ENV PYTHONPATH=/app
+
 EXPOSE 8501
-CMD ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+
+CMD ["streamlit", "run", "ui/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]

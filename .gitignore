@@ -1,47 +1,27 @@
-# Python
-__pycache__/
-*.py[cod]
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.idea
+.vscode
 
-# Virtual env
-.venv/
-venv/
+outputs
+data
+datasets
+artifacts
+reports
+tmp
+temp
+logs
 
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Secrets
-.env
-.env.*
-!.env.example
-
-# Tests / cache
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Artifacts and outputs
-outputs/
-data/
-models/
-artifacts/
-bundle/
-
-# Serialized models / datasets
+*.csv
 *.parquet
 *.pkl
 *.joblib
 *.zip
-
-# Logs / temp
-*.log
-tmp/
-temp/
-*.tmp

@@ -1,337 +1,218 @@
+# churnlib/feature_module.py
 from __future__ import annotations
+
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 
 
-EPS = 1e-9
-
-
-def _entropy_from_counts(counts: np.ndarray) -> float:
+def _safe_entropy(counts: np.ndarray) -> float:
     counts = np.asarray(counts, dtype=float)
-    total = counts.sum()
-    if total <= 0:
+    s = counts.sum()
+    if s <= 0:
         return 0.0
-    p = counts / total
-    p = p[p > 0]
+    p = counts / s
+    p = np.clip(p, 1e-12, 1.0)
     return float(-(p * np.log(p)).sum())
 
 
-def _slope_from_series(values: np.ndarray) -> float:
-    values = np.asarray(values, dtype=float)
-    if len(values) < 2:
-        return 0.0
-    x = np.arange(len(values), dtype=float)
-    x_mean = x.mean()
-    y_mean = values.mean()
-    denom = ((x - x_mean) ** 2).sum()
-    if denom <= 0:
-        return 0.0
-    return float(((x - x_mean) * (values - y_mean)).sum() / denom)
-
-
-def build_transaction_features(past: pd.DataFrame, anchor_time: pd.Timestamp) -> pd.DataFrame:
+def aggregate_extra_features(
+    df: pd.DataFrame,
+    id_col: str,
+    time_col: str,
+    extra_cols: List[str],
+    anchor_time: pd.Timestamp,
+    prefix: str = "extra",
+    max_cols: int = 20,
+) -> pd.DataFrame:
     """
-    Build transaction-level customer features from the past window.
-    Expected canonical columns:
-      customer_id, transaction_id, event_time, amount
-    Optional:
-      item_id, quantity, country, unit_price, is_cancellation
+    Превращает произвольные extra cols в числовые агрегаты по entity.
+    Важно: НЕ добавляем строковые колонки напрямую (иначе ML упадёт).
     """
+    extra_cols = [c for c in extra_cols if c in df.columns]
+    extra_cols = extra_cols[:max_cols]
+    if not extra_cols:
+        return pd.DataFrame(columns=[id_col]).set_index(id_col)
 
-    df = past.copy()
+    # сортировка для last
+    df_sorted = df.sort_values(time_col).copy()
 
-    # normalize dtypes
-    df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
+    out_parts = []
+    for col in extra_cols:
+        s = df[col]
+
+        # 1) пробуем datetime
+        dt = pd.to_datetime(s, errors="coerce", utc=True)
+        dt_share = float(dt.notna().mean())
+
+        if dt_share >= 0.8:
+            # возраст признака в днях (anchor_time - dt)
+            age_days = (anchor_time - dt).dt.total_seconds() / 86400.0
+            tmp = pd.DataFrame({id_col: df[id_col], "_v": age_days})
+            agg = tmp.groupby(id_col)["_v"].agg(["mean", "std", "min", "max"]).rename(
+                columns={
+                    "mean": f"{prefix}__{col}__age_mean_days",
+                    "std": f"{prefix}__{col}__age_std_days",
+                    "min": f"{prefix}__{col}__age_min_days",
+                    "max": f"{prefix}__{col}__age_max_days",
+                }
+            )
+            out_parts.append(agg)
+            continue
+
+        # 2) пробуем numeric
+        num = pd.to_numeric(s, errors="coerce")
+        num_share = float(num.notna().mean())
+
+        if num_share >= 0.8:
+            tmp = pd.DataFrame({id_col: df[id_col], "_v": num})
+            agg = tmp.groupby(id_col)["_v"].agg(["mean", "std", "min", "max", "sum"]).rename(
+                columns={
+                    "mean": f"{prefix}__{col}__mean",
+                    "std": f"{prefix}__{col}__std",
+                    "min": f"{prefix}__{col}__min",
+                    "max": f"{prefix}__{col}__max",
+                    "sum": f"{prefix}__{col}__sum",
+                }
+            )
+            # last numeric
+            last = (
+                pd.DataFrame({id_col: df_sorted[id_col], "_v": pd.to_numeric(df_sorted[col], errors="coerce")})
+                .dropna(subset=["_v"])
+                .groupby(id_col)["_v"]
+                .last()
+                .rename(f"{prefix}__{col}__last")
+            )
+            agg = agg.join(last, how="left")
+            out_parts.append(agg)
+            continue
+
+        # 3) categorical → только числовые summary
+        cat = s.astype(str)
+        cat = cat.replace("nan", np.nan).fillna("NA")
+
+        # nunique
+        nunique = df.groupby(id_col)[col].nunique(dropna=True).rename(f"{prefix}__{col}__nunique")
+
+        # top1 share + entropy (через loop, т.к. групповые value_counts)
+        ent = {}
+        top1 = {}
+        for gid, sub in df[[id_col, col]].copy().fillna("NA").groupby(id_col):
+            vc = sub[col].astype(str).value_counts()
+            ent[gid] = _safe_entropy(vc.values)
+            top1[gid] = float(vc.iloc[0] / vc.sum()) if vc.sum() else 0.0
+
+        ent_s = pd.Series(ent, name=f"{prefix}__{col}__entropy")
+        top1_s = pd.Series(top1, name=f"{prefix}__{col}__top1_share")
+
+        # missing share per entity
+        miss = df[col].isna().groupby(df[id_col]).mean().rename(f"{prefix}__{col}__missing_share")
+
+        agg = pd.concat([nunique, ent_s, top1_s, miss], axis=1)
+        out_parts.append(agg)
+
+    out = pd.concat(out_parts, axis=1)
+    out.index.name = id_col
+    return out
+
+
+def build_transaction_features(
+    df: pd.DataFrame,
+    anchor_time: pd.Timestamp,
+    extra_feature_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Строит RFM‑подобные признаки по транзакциям.
+    Возвращает DataFrame с customer_id + числовые признаки.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
     df["customer_id"] = df["customer_id"].astype(str)
-    df["transaction_id"] = df["transaction_id"].astype(str)
+    df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce", utc=True)
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
-    if "quantity" in df.columns:
-        df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
-    if "unit_price" in df.columns:
-        df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce")
-    if "country" in df.columns:
-        df["country"] = df["country"].astype(str)
-    if "item_id" in df.columns:
-        df["item_id"] = df["item_id"].astype(str)
+    if "is_cancellation" in df.columns:
+        df["is_cancellation"] = df["is_cancellation"].astype(bool)
+    else:
+        df["is_cancellation"] = False
 
-    if "is_cancellation" not in df.columns:
-        df["is_cancellation"] = df["transaction_id"].astype(str).str.startswith("C")
-
-    purchase_df = df[~df["is_cancellation"]].copy()
-    cancel_df = df[df["is_cancellation"]].copy()
-
-    purchase_df = purchase_df.dropna(subset=["customer_id", "transaction_id", "event_time", "amount"]).copy()
-    purchase_df = purchase_df[purchase_df["amount"] > 0].copy()
-
+    # берём только "реальные покупки"
+    purchase_df = df.loc[~df["is_cancellation"]].copy()
     if purchase_df.empty:
         return pd.DataFrame()
 
-    # invoice-level
-    inv = (
-        purchase_df.groupby(["customer_id", "transaction_id"], as_index=False)
-        .agg(
-            inv_time=("event_time", "max"),
-            inv_amount=("amount", "sum"),
-            purchase_day=("event_time", lambda x: x.max().normalize()),
+    # базовые агрегаты
+    g = purchase_df.groupby("customer_id", as_index=False)
+
+    freq = g["transaction_id"].count().rename(columns={"transaction_id": "frequency_tx"})
+    monetary = g["amount"].sum().rename(columns={"amount": "monetary"})
+    amount_mean = g["amount"].mean().rename(columns={"amount": "amount_mean"})
+    amount_std = g["amount"].std().rename(columns={"amount": "amount_std"})
+
+    first_time = g["event_time"].min().rename(columns={"event_time": "first_purchase_time"})
+    last_time = g["event_time"].max().rename(columns={"event_time": "last_purchase_time"})
+
+    feat = freq.merge(monetary, on="customer_id").merge(amount_mean, on="customer_id").merge(amount_std, on="customer_id")
+    feat = feat.merge(first_time, on="customer_id").merge(last_time, on="customer_id")
+
+    feat["recency_days"] = (anchor_time - feat["last_purchase_time"]).dt.total_seconds() / 86400.0
+    feat["customer_lifetime_days"] = (anchor_time - feat["first_purchase_time"]).dt.total_seconds() / 86400.0
+
+    # межпокупочный интервал
+    purchase_df = purchase_df.sort_values(["customer_id", "event_time"])
+    purchase_df["prev_time"] = purchase_df.groupby("customer_id")["event_time"].shift(1)
+    purchase_df["delta_days"] = (purchase_df["event_time"] - purchase_df["prev_time"]).dt.total_seconds() / 86400.0
+    ip = purchase_df.groupby("customer_id")["delta_days"].agg(["mean", "std"]).rename(
+        columns={"mean": "interpurchase_mean_days", "std": "interpurchase_std_days"}
+    )
+    feat = feat.merge(ip, left_on="customer_id", right_index=True, how="left")
+
+    # optional: quantity
+    if "quantity" in purchase_df.columns:
+        purchase_df["quantity"] = pd.to_numeric(purchase_df["quantity"], errors="coerce")
+        q = purchase_df.groupby("customer_id")["quantity"].agg(["sum", "mean"]).rename(
+            columns={"sum": "qty_sum", "mean": "qty_mean"}
         )
-    )
+        feat = feat.merge(q, left_on="customer_id", right_index=True, how="left")
 
-    # ---------- Base RFM+ ----------
-    last_purchase = inv.groupby("customer_id")["inv_time"].max()
-    first_purchase = inv.groupby("customer_id")["inv_time"].min()
-    frequency_tx = inv.groupby("customer_id")["transaction_id"].nunique()
-    monetary = inv.groupby("customer_id")["inv_amount"].sum()
-
-    recency_days = (anchor_time - last_purchase).dt.days
-    days_since_first_purchase = (anchor_time - first_purchase).dt.days
-    customer_lifetime_days = (last_purchase - first_purchase).dt.days
-
-    avg_basket_value = inv.groupby("customer_id")["inv_amount"].mean()
-    median_basket_value = inv.groupby("customer_id")["inv_amount"].median()
-    max_basket_value = inv.groupby("customer_id")["inv_amount"].max()
-    min_basket_value = inv.groupby("customer_id")["inv_amount"].min()
-    basket_std = inv.groupby("customer_id")["inv_amount"].std().fillna(0.0)
-    number_of_purchase_days = inv.groupby("customer_id")["purchase_day"].nunique()
-
-    # ---------- Interpurchase ----------
-    inv_sorted = inv.sort_values(["customer_id", "inv_time"]).copy()
-    gap_rows = []
-    for cid, sub in inv_sorted.groupby("customer_id"):
-        dts = sub["inv_time"].values
-        if len(dts) < 2:
-            gaps = np.array([], dtype=float)
-        else:
-            gaps = np.diff(dts).astype("timedelta64[D]").astype(float)
-
-        if len(gaps) == 0:
-            gap_mean = np.nan
-            gap_median = np.nan
-            gap_std = np.nan
-            gap_cv = np.nan
-        else:
-            gap_mean = float(np.mean(gaps))
-            gap_median = float(np.median(gaps))
-            gap_std = float(np.std(gaps))
-            gap_cv = float(gap_std / (gap_mean + EPS))
-
-        gap_rows.append({
-            "customer_id": cid,
-            "interpurchase_mean_days": gap_mean,
-            "interpurchase_median_days": gap_median,
-            "interpurchase_std_days": gap_std,
-            "interpurchase_cv_days": gap_cv,
-        })
-    gap_df = pd.DataFrame(gap_rows).set_index("customer_id")
-
-    # ---------- Rolling windows ----------
-    def line_amount_sum(days: int):
-        mask = (purchase_df["event_time"] > anchor_time - pd.Timedelta(days=days)) & (purchase_df["event_time"] <= anchor_time)
-        return purchase_df.loc[mask].groupby("customer_id")["amount"].sum()
-
-    def tx_count(days: int):
-        mask = (inv["inv_time"] > anchor_time - pd.Timedelta(days=days)) & (inv["inv_time"] <= anchor_time)
-        return inv.loc[mask].groupby("customer_id")["transaction_id"].nunique()
-
-    spend_last7 = line_amount_sum(7)
-    spend_last30 = line_amount_sum(30)
-    spend_last60 = line_amount_sum(60)
-    spend_last90 = line_amount_sum(90)
-
-    tx_last7 = tx_count(7)
-    tx_last30 = tx_count(30)
-    tx_last60 = tx_count(60)
-    tx_last90 = tx_count(90)
-
-    prev30_mask = (purchase_df["event_time"] > anchor_time - pd.Timedelta(days=60)) & (
-        purchase_df["event_time"] <= anchor_time - pd.Timedelta(days=30)
-    )
-    spend_prev30 = purchase_df.loc[prev30_mask].groupby("customer_id")["amount"].sum()
-
-    prev60_mask = (purchase_df["event_time"] > anchor_time - pd.Timedelta(days=120)) & (
-        purchase_df["event_time"] <= anchor_time - pd.Timedelta(days=60)
-    )
-    spend_prev60 = purchase_df.loc[prev60_mask].groupby("customer_id")["amount"].sum()
-
-    ratio_last30_prev30 = (spend_last30 / (spend_prev30 + EPS)).replace([np.inf, -np.inf], np.nan)
-    ratio_last60_prev60 = (spend_last60 / (spend_prev60 + EPS)).replace([np.inf, -np.inf], np.nan)
-
-    # ---------- Trend slopes ----------
-    trend_rows = []
-    for cid, sub in purchase_df.groupby("customer_id"):
-        amounts = []
-        txs = []
-        for i in range(6, 0, -1):  # last 6 windows of 30d
-            start = anchor_time - pd.Timedelta(days=i * 30)
-            end = anchor_time - pd.Timedelta(days=(i - 1) * 30)
-            win = sub[(sub["event_time"] > start) & (sub["event_time"] <= end)]
-            amounts.append(float(win["amount"].sum()))
-            txs.append(float(win["transaction_id"].nunique()))
-        trend_rows.append({
-            "customer_id": cid,
-            "spend_slope_6x30d": _slope_from_series(np.array(amounts)),
-            "tx_slope_6x30d": _slope_from_series(np.array(txs)),
-        })
-    trend_df = pd.DataFrame(trend_rows).set_index("customer_id")
-
-    # ---------- Stability / regularity ----------
-    inv["week_key"] = inv["inv_time"].dt.isocalendar().year.astype(int) * 100 + inv["inv_time"].dt.isocalendar().week.astype(int)
-    inv["month_key"] = inv["inv_time"].dt.year.astype(int) * 100 + inv["inv_time"].dt.month.astype(int)
-
-    active_weeks = inv.groupby("customer_id")["week_key"].nunique()
-    active_months = inv.groupby("customer_id")["month_key"].nunique()
-
-    history_days = max(1, int((anchor_time - purchase_df["event_time"].min()).days))
-    active_weeks_ratio = active_weeks / max(1, int(np.ceil(history_days / 7)))
-    active_months_ratio = active_months / max(1, int(np.ceil(history_days / 30)))
-
-    repeat_purchase_rate = frequency_tx / (number_of_purchase_days + EPS)
-    regularity_score = 1.0 / (gap_df["interpurchase_cv_days"] + 1.0)
-
-    # ---------- Diversity ----------
-    diversity_df = None
-    if "item_id" in purchase_df.columns:
-        div_rows = []
-        for cid, sub in purchase_df.groupby("customer_id"):
-            item_counts = sub["item_id"].astype(str).value_counts()
-            unique_items_count = int(item_counts.shape[0])
-            unique_item_ratio = float(unique_items_count / (len(sub) + EPS))
-            item_entropy = _entropy_from_counts(item_counts.values)
-            top1_item_concentration = float(item_counts.iloc[0] / item_counts.sum()) if len(item_counts) else 0.0
-            top3_item_concentration = float(item_counts.iloc[:3].sum() / item_counts.sum()) if len(item_counts) else 0.0
-            repeated_items_share = float(item_counts[item_counts > 1].sum() / (item_counts.sum() + EPS))
-            new_items_share = float(item_counts[item_counts == 1].sum() / (item_counts.sum() + EPS))
-            div_rows.append({
-                "customer_id": cid,
-                "unique_items_count": unique_items_count,
-                "unique_item_ratio": unique_item_ratio,
-                "item_entropy": item_entropy,
-                "top1_item_concentration": top1_item_concentration,
-                "top3_item_concentration": top3_item_concentration,
-                "repeated_items_share": repeated_items_share,
-                "new_items_share": new_items_share,
-            })
-        diversity_df = pd.DataFrame(div_rows).set_index("customer_id")
-
-    # ---------- Price / value ----------
-    price_df = None
+    # optional: unit_price
     if "unit_price" in purchase_df.columns:
-        q75_price = purchase_df["unit_price"].quantile(0.75)
-        q25_price = purchase_df["unit_price"].quantile(0.25)
-
-        price_rows = []
-        for cid, sub in purchase_df.groupby("customer_id"):
-            unit_price = pd.to_numeric(sub["unit_price"], errors="coerce").dropna()
-            avg_item_price = float(unit_price.mean()) if len(unit_price) else np.nan
-            median_item_price = float(unit_price.median()) if len(unit_price) else np.nan
-            value_volatility = float(unit_price.std()) if len(unit_price) > 1 else 0.0
-            expensive_purchase_ratio = float((unit_price > q75_price).mean()) if len(unit_price) else 0.0
-            low_price_share = float((unit_price <= q25_price).mean()) if len(unit_price) else 0.0
-
-            price_rows.append({
-                "customer_id": cid,
-                "avg_item_price": avg_item_price,
-                "median_item_price": median_item_price,
-                "value_volatility": value_volatility,
-                "expensive_purchase_ratio": expensive_purchase_ratio,
-                "low_price_share": low_price_share,
-            })
-        price_df = pd.DataFrame(price_rows).set_index("customer_id")
-
-    # ---------- Country ----------
-    country_df = None
-    if "country" in purchase_df.columns:
-        country_mode = (
-            purchase_df.groupby("customer_id")["country"]
-            .agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else "UNK")
+        purchase_df["unit_price"] = pd.to_numeric(purchase_df["unit_price"], errors="coerce")
+        up = purchase_df.groupby("customer_id")["unit_price"].agg(["mean", "std"]).rename(
+            columns={"mean": "unit_price_mean", "std": "unit_price_std"}
         )
-        country_counts = purchase_df["country"].astype(str).value_counts(normalize=True)
+        feat = feat.merge(up, left_on="customer_id", right_index=True, how="left")
 
-        country_df = pd.DataFrame({
-            "is_uk": (country_mode == "United Kingdom").astype(int),
-            "country_freq": country_mode.map(country_counts).fillna(0.0),
-        })
+    # optional: item diversity
+    if "item_id" in purchase_df.columns:
+        item_n = purchase_df.groupby("customer_id")["item_id"].nunique(dropna=True).rename("item_nunique")
+        feat = feat.merge(item_n, left_on="customer_id", right_index=True, how="left")
 
-    # ---------- Seasonality ----------
-    seasonality_df = pd.DataFrame({
-        "last_purchase_month": last_purchase.dt.month.astype(int),
-        "last_purchase_quarter": last_purchase.dt.quarter.astype(int),
-        "last_purchase_dayofweek": last_purchase.dt.dayofweek.astype(int),
-        "holiday_season_flag": last_purchase.dt.month.isin([11, 12]).astype(int),
-    })
+    # optional: country summary (как простой proxy)
+    if "country" in purchase_df.columns:
+        country_nu = purchase_df.groupby("customer_id")["country"].nunique(dropna=True).rename("country_nunique")
+        feat = feat.merge(country_nu, left_on="customer_id", right_index=True, how="left")
 
-    christmas_current_year = pd.to_datetime(last_purchase.dt.year.astype(str) + "-12-25", utc=True)
-    seasonality_df["days_to_christmas"] = (christmas_current_year - last_purchase).dt.days
+    # NEW: extra feature cols
+    if extra_feature_cols:
+        extra_df = aggregate_extra_features(
+            purchase_df,
+            id_col="customer_id",
+            time_col="event_time",
+            extra_cols=list(extra_feature_cols),
+            anchor_time=anchor_time,
+            prefix="extra",
+            max_cols=20,
+        ).reset_index()
+        feat = feat.merge(extra_df, on="customer_id", how="left")
 
-    # ---------- Returns / cancellations ----------
-    if not cancel_df.empty:
-        cancel_df["abs_amount"] = pd.to_numeric(cancel_df["amount"], errors="coerce").abs()
+    # финальная чистка
+    feat = feat.replace([np.inf, -np.inf], np.nan)
 
-        cancel_count = cancel_df.groupby("customer_id")["transaction_id"].nunique()
-        cancel_amount = cancel_df.groupby("customer_id")["abs_amount"].sum()
+    # убираем служебные datetime (модели их не любят)
+    feat = feat.drop(columns=["first_purchase_time", "last_purchase_time"], errors="ignore")
 
-        purchase_count = purchase_df.groupby("customer_id")["transaction_id"].nunique()
-        purchase_amount = purchase_df.groupby("customer_id")["amount"].sum()
-
-        return_df = pd.DataFrame({
-            "had_return": (cancel_count > 0).astype(int),
-            "return_count": cancel_count,
-            "return_ratio": cancel_count / (purchase_count + EPS),
-            "canceled_amount_ratio": cancel_amount / (purchase_amount + EPS),
-        }).fillna(0.0)
-    else:
-        return_df = pd.DataFrame(index=purchase_df["customer_id"].unique())
-        return_df["had_return"] = 0
-        return_df["return_count"] = 0.0
-        return_df["return_ratio"] = 0.0
-        return_df["canceled_amount_ratio"] = 0.0
-
-    # ---------- Final merge ----------
-    base = pd.DataFrame({
-        "recency_days": recency_days,
-        "frequency_tx": frequency_tx,
-        "monetary": monetary,
-        "avg_basket_value": avg_basket_value,
-        "median_basket_value": median_basket_value,
-        "max_basket_value": max_basket_value,
-        "min_basket_value": min_basket_value,
-        "basket_std": basket_std,
-        "number_of_purchase_days": number_of_purchase_days,
-        "days_since_first_purchase": days_since_first_purchase,
-        "customer_lifetime_days": customer_lifetime_days,
-        "spend_last7": spend_last7,
-        "spend_last30": spend_last30,
-        "spend_last60": spend_last60,
-        "spend_last90": spend_last90,
-        "tx_last7": tx_last7,
-        "tx_last30": tx_last30,
-        "tx_last60": tx_last60,
-        "tx_last90": tx_last90,
-        "spend_prev30": spend_prev30,
-        "spend_prev60": spend_prev60,
-        "ratio_last30_prev30": ratio_last30_prev30,
-        "ratio_last60_prev60": ratio_last60_prev60,
-        "active_weeks": active_weeks,
-        "active_months": active_months,
-        "active_weeks_ratio": active_weeks_ratio,
-        "active_months_ratio": active_months_ratio,
-        "repeat_purchase_rate": repeat_purchase_rate,
-        "regularity_score": regularity_score,
-    })
-
-    base = base.join(gap_df, how="left")
-    base = base.join(trend_df, how="left")
-    base = base.join(seasonality_df, how="left")
-    base = base.join(return_df, how="left")
-
-    if diversity_df is not None:
-        base = base.join(diversity_df, how="left")
-    if price_df is not None:
-        base = base.join(price_df, how="left")
-    if country_df is not None:
-        base = base.join(country_df, how="left")
-
-    base = base.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    base = base.reset_index().rename(columns={"index": "customer_id"})
-    return base
+    return feat
