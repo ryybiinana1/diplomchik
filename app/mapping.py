@@ -32,13 +32,13 @@ CONTRACTS: Dict[TemplateName, Dict[str, Any]] = {
                 "type": "datetime",
                 "meaning": "Когда была совершена покупка/операция.",
             },
+        },
+        "optional": {
             "amount": {
                 "title": "Сумма операции",
                 "type": "float",
-                "meaning": "Стоимость/выручка операции (общая сумма).",
+                "meaning": "Общая выручка по строке. Если в файле только «цена за штуку» и «количество», оставьте пустым и заполните поля «Цена за единицу» и «Количество» ниже — сумма будет посчитана как цена × количество.",
             },
-        },
-        "optional": {
             "item_id": {
                 "title": "ID товара",
                 "type": "string",
@@ -57,7 +57,7 @@ CONTRACTS: Dict[TemplateName, Dict[str, Any]] = {
             "unit_price": {
                 "title": "Цена за единицу",
                 "type": "float",
-                "meaning": "Цена за единицу (если доступно).",
+                "meaning": "Цена за одну штуку. Вместе с «Количеством» заменяет колонку «Сумма операции», если отдельной суммы в файле нет.",
             },
             "is_cancellation": {
                 "title": "Флаг отмены",
@@ -152,9 +152,21 @@ ALIASES: Dict[TemplateName, Dict[str, List[str]]] = {
         "event_time": ["event_time", "date", "datetime", "timestamp", "created_at", "paid_at", "purchase_date"],
         "amount": ["amount", "price", "revenue", "total", "sum", "value", "gmv", "order_total"],
         "item_id": ["item", "product", "sku", "product_id", "itemid"],
-        "quantity": ["qty", "quantity", "count", "units"],
+        "quantity": ["qty", "quantity", "count", "units", "pieces", "pcs", "num_items", "items_count", "n_items"],
         "country": ["country", "geo", "region_country", "billing_country"],
-        "unit_price": ["unit_price", "price_per_unit", "ppu"],
+        "unit_price": [
+            "unit_price",
+            "price_per_unit",
+            "ppu",
+            "item_price",
+            "product_price",
+            "unit_cost",
+            "price_for_item",
+            "line_price",
+            "cost",
+            "goods_price",
+            "product_cost",
+        ],
         "is_cancellation": ["is_cancellation", "is_refund", "refund", "cancel", "cancellation", "returned"],
         "promo_code": ["promo", "promo_code", "coupon", "discount_code", "campaign"],
     },
@@ -230,11 +242,32 @@ def detect_mapping(columns: List[str], template: str, threshold: float = 0.62) -
     return out
 
 
+def transactions_financial_sources_ok(mapping: Dict[str, Any]) -> bool:
+    """Достаточно данных для суммы строки: либо колонка amount, либо unit_price и quantity."""
+    if mapping.get("amount"):
+        return True
+    return bool(mapping.get("unit_price")) and bool(mapping.get("quantity"))
+
+
 def validate_mapping(mapping: Dict[str, str], template: str, available_columns: List[str]) -> None:
     contract = get_contract(template)
     required = list(contract["required"].keys())
 
-    missing_required = [f for f in required if not mapping.get(f)]
+    if template == "transactions":
+        if not transactions_financial_sources_ok(mapping):
+            raise ValueError(
+                "Для транзакций укажите колонку «Сумма операции» или обе колонки "
+                "«Цена за единицу» и «Количество» (сумма строки будет цена × количество)."
+            )
+        core = ["customer_id", "transaction_id", "event_time"]
+        if mapping.get("amount"):
+            core.append("amount")
+        else:
+            core.extend(["unit_price", "quantity"])
+        missing_required = [f for f in core if not mapping.get(f)]
+    else:
+        missing_required = [f for f in required if not mapping.get(f)]
+
     if missing_required:
         raise ValueError(f"Не сопоставлены обязательные поля: {missing_required}")
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ class SnapshotConfig:
 
     # NEW:
     extra_feature_cols: Optional[List[str]] = None
+    extra_feature_config: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 def canonicalize_types(df: pd.DataFrame, template: str) -> pd.DataFrame:
@@ -75,6 +76,7 @@ def canonicalize_types(df: pd.DataFrame, template: str) -> pd.DataFrame:
 def build_snapshots(df: pd.DataFrame, cfg: SnapshotConfig) -> pd.DataFrame:
     template = cfg.template
     extra_cols = cfg.extra_feature_cols or []
+    extra_cfg = cfg.extra_feature_config or {}
 
     if template == "transactions":
         df = df.dropna(subset=["event_time", "customer_id", "transaction_id", "amount"]).copy()
@@ -98,7 +100,12 @@ def build_snapshots(df: pd.DataFrame, cfg: SnapshotConfig) -> pd.DataFrame:
             future = df[(df["event_time"] > t) & (df["event_time"] <= future_end)].copy()
             future_buyers = set(future.loc[~future["is_cancellation"], "customer_id"].unique())
 
-            feat = build_transaction_features(past, t, extra_feature_cols=extra_cols)
+            feat = build_transaction_features(
+                past,
+                t,
+                extra_feature_cols=extra_cols,
+                extra_feature_config=extra_cfg,
+            )
             if feat.empty:
                 continue
 
@@ -176,6 +183,7 @@ def build_snapshots(df: pd.DataFrame, cfg: SnapshotConfig) -> pd.DataFrame:
                     id_col="account_id",
                     time_col="period_end_dt",
                     extra_cols=extra_cols,
+                    extra_feature_config=extra_cfg,
                     anchor_time=t,
                     prefix="extra",
                 ).reset_index().rename(columns={"account_id": "entity_id"})
@@ -234,6 +242,7 @@ def build_snapshots(df: pd.DataFrame, cfg: SnapshotConfig) -> pd.DataFrame:
                     id_col="subject_id",
                     time_col="event_time",
                     extra_cols=extra_cols,
+                    extra_feature_config=extra_cfg,
                     anchor_time=t,
                     prefix="extra",
                 ).reset_index().rename(columns={"subject_id": "entity_id"})
@@ -253,6 +262,7 @@ def build_latest_snapshot(df: pd.DataFrame, cfg: SnapshotConfig) -> pd.DataFrame
     """
     template = cfg.template
     extra_cols = cfg.extra_feature_cols or []
+    extra_cfg = cfg.extra_feature_config or {}
 
     if template == "transactions":
         df = df.dropna(subset=["event_time", "customer_id", "transaction_id", "amount"]).copy()
@@ -260,7 +270,12 @@ def build_latest_snapshot(df: pd.DataFrame, cfg: SnapshotConfig) -> pd.DataFrame
         past_start = t - pd.Timedelta(days=cfg.history_days)
         past = df[(df["event_time"] > past_start) & (df["event_time"] <= t)].copy()
 
-        feat = build_transaction_features(past, t, extra_feature_cols=extra_cols)
+        feat = build_transaction_features(
+            past,
+            t,
+            extra_feature_cols=extra_cols,
+            extra_feature_config=extra_cfg,
+        )
         if feat.empty:
             return pd.DataFrame()
 
@@ -312,6 +327,7 @@ def build_latest_snapshot(df: pd.DataFrame, cfg: SnapshotConfig) -> pd.DataFrame
                 id_col="account_id",
                 time_col="period_end_dt",
                 extra_cols=extra_cols,
+                extra_feature_config=extra_cfg,
                 anchor_time=t,
                 prefix="extra",
             ).reset_index().rename(columns={"account_id": "entity_id"})
@@ -350,6 +366,7 @@ def build_latest_snapshot(df: pd.DataFrame, cfg: SnapshotConfig) -> pd.DataFrame
                 id_col="subject_id",
                 time_col="event_time",
                 extra_cols=extra_cols,
+                extra_feature_config=extra_cfg,
                 anchor_time=t,
                 prefix="extra",
             ).reset_index().rename(columns={"subject_id": "entity_id"})

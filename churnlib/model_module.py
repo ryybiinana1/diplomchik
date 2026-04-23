@@ -10,6 +10,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,21 @@ def _get_model(kind: str, random_state: int, params: Optional[Dict] = None, pos_
             base["scale_pos_weight"] = pos_weight
         base.update({k: v for k, v in params.items() if k != "use_pos_weight"})
         return CatBoostClassifier(**base)
+
+    if kind == "mlp":
+        base = dict(
+            hidden_layer_sizes=(128, 64),
+            activation="relu",
+            alpha=1e-4,
+            learning_rate_init=1e-3,
+            batch_size=256,
+            max_iter=300,
+            early_stopping=True,
+            validation_fraction=0.1,
+            random_state=random_state,
+        )
+        base.update(params)
+        return MLPClassifier(**base)
 
     raise ValueError(f"Unknown model kind: {kind}")
 

@@ -1,157 +1,333 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import pandas as pd
 import streamlit as st
 
-from ui.components.nav import page_nav
 from ui.api_client import ApiClient
-from ui.state import get_state
+from ui.components.status_cards import metric_card_row
+from ui.poll_rerun import schedule_autorefresh
+from ui.components.nav import page_nav
+from ui.state import get_state, read_csv_cached
+from ui.steps import (
+    METRIC_LABELS,
+    MODEL_KIND_LABELS,
+    STEP_2_ANALYTICS,
+    STEP_4_QUALITY,
+    TRAINING_STAGE_LABELS,
+    format_model_kind,
+)
+
+
+def _stage_label(stage: str) -> str:
+    return TRAINING_STAGE_LABELS.get(stage, stage.replace("_", " ").capitalize())
+
+
+def _row_count_from_state(state) -> int:
+    if state.inspect:
+        quality = state.inspect.get("quality_report", {}) or {}
+        n_rows = quality.get("n_rows")
+        if n_rows is not None:
+            return int(n_rows)
+    if state.working_file_bytes:
+        try:
+            return int(len(read_csv_cached(state.working_file_bytes)))
+        except Exception:
+            return 0
+    return 0
+
+
+def _recommended_mode(rows: int) -> str:
+    if rows >= 50000:
+        return "compare"
+    if rows >= 5000:
+        return "balanced"
+    return "fast"
+
+
+def _estimated_runtime_hint(experiments: int) -> str:
+    if experiments <= 2:
+        return "быстро"
+    if experiments <= 8:
+        return "умеренно"
+    return "долго"
 
 
 def page():
+    if st.session_state.pop("_job_just_started", False):
+        st.success("Обучение запущено. Ниже можно смотреть прогресс.")
+
     st.title("Обучение модели")
-    st.caption("Шаг 3: выбираем режим и обучаем. Всё объясняется простым языком.")
+    st.caption(
+        "Пользователь задаёт бизнес-смысл прогноза: горизонт и глубину подбора. "
+        "Технические ML-настройки спрятаны в расширенный блок."
+    )
 
     api = ApiClient.from_env()
     state = get_state()
 
-    if not state.file_bytes or not state.mapping:
-        st.warning("Сначала пройдите шаги «Готовность данных» и «Сопоставление колонок».")
-        page_nav("Сопоставление", "Качество модели")
+    if not state.working_file_bytes or not state.mapping:
+        st.warning("Сначала выполните шаги «Данные и колонки» и «Анализ».")
+        page_nav(STEP_2_ANALYTICS, STEP_4_QUALITY)
         return
 
-    mode = st.radio(
-        "Режим обучения",
-        ["quick", "deep"],
-        format_func=lambda x: "Быстрый запуск" if x == "quick" else "Максимальное качество",
+    row_count = _row_count_from_state(state)
+    recommended_mode = _recommended_mode(row_count)
+
+    preset = st.radio(
+        "Режим запуска",
+        options=["fast", "balanced", "compare"],
+        format_func=lambda x: {
+            "fast": "Быстро",
+            "balanced": "Сбалансировано",
+            "compare": "Тщательное сравнение",
+        }.get(x, x),
         horizontal=True,
     )
 
-    st.subheader("Настройки")
+    if recommended_mode != preset:
+        st.info(
+            {
+                "fast": "По объёму данных системе больше подходит быстрый baseline.",
+                "balanced": "По объёму данных системе больше подходит сбалансированный режим.",
+                "compare": "По объёму данных можно запускать тщательное сравнение.",
+            }[recommended_mode]
+        )
 
-    if mode == "quick":
+    model_name = st.text_input(
+        "Название модели",
+        value="Моя модель",
+        placeholder="Например: baseline_v1",
+        help="Отображается в шаге «Прогноз» при выборе модели.",
+    )
+
+    st.markdown("### Что хотим получить")
+    enable_shap = st.checkbox("Добавить интерпретацию признаков в отчёт", value=False)
+
+    st.info(
+        {
+            "fast": "Один устойчивый baseline без лишних настроек.",
+            "balanced": "Небольшое сравнение сильных моделей без перегрузки параметрами.",
+            "compare": "Полный режим для лидерборда и выбора лучшего варианта.",
+        }[preset]
+    )
+
+    if row_count:
+        metric_card_row(
+            [
+                ("Строк в датасете", f"{row_count:,}".replace(",", " ")),
+                ("Выбрано доп. признаков", str(len(state.extra_feature_cols or []))),
+                ("Рекомендованный режим", {"fast": "Быстро", "balanced": "Сбалансировано", "compare": "Тщательное"}[recommended_mode]),
+            ]
+        )
+
+    min_events_in_history = 1
+    metric_key = "pr_auc"
+    calibration_grid = ["sigmoid"]
+    step_days = 30
+
+    if preset == "fast":
         horizon = st.selectbox("Горизонт прогноза (дней)", [30, 60, 90], index=0)
-        history = st.selectbox("Окно истории (дней)", [90, 180, 365], index=1)
-        model_kind = st.selectbox("Модель", ["lightgbm", "logreg", "random_forest"], index=0)
-        enable_shap = st.checkbox("Добавить объяснения (SHAP) в отчёт", value=False)
-
+        default_history = {30: 180, 60: 180, 90: 365}[int(horizon)]
+        history_days = default_history
+        step_days = 30
+        selected_models_display = [format_model_kind("lightgbm")]
+        st.caption("Система обучит один сильный baseline на фиксированных настройках.")
+        with st.expander("Тонкая настройка", expanded=False):
+            history_days = st.selectbox("Окно истории", [90, 180, 365], index=[90, 180, 365].index(default_history))
+            step_days = st.selectbox("Шаг точки отсчёта", [7, 14, 30], index=2)
+            min_events_in_history = st.selectbox("Минимум событий в истории", [1, 2, 3], index=0)
         params = {
+            "mode": "quick",
+            "model_name": model_name.strip(),
             "horizon_days": int(horizon),
-            "history_days": int(history),
-            "step_days": 30,
-            "min_events_in_history": 1,
-            "model_kind": model_kind,
+            "history_days": int(history_days),
+            "step_days": int(step_days),
+            "min_events_in_history": int(min_events_in_history),
+            "model_kind": "lightgbm",
             "calibration": "sigmoid",
             "enable_shap": bool(enable_shap),
             "extra_feature_cols": state.extra_feature_cols or [],
+            "extra_feature_config": state.extra_feature_config or {},
         }
-
-        st.caption("Что будет сделано: 1 конфигурация, быстрое обучение, короткий отчёт.")
-
-    else:
-        horizons = st.multiselect("Горизонты (дней)", [30, 60, 90], default=[30, 60, 90])
-        histories = st.multiselect("Окна истории (дней)", [90, 180, 365], default=[180, 365])
-        steps = st.multiselect("Шаг анкеров (дней)", [7, 14, 30], default=[30])
-        models = st.multiselect(
-            "Модели",
-            ["lightgbm", "logreg", "random_forest", "sklearn_gbdt", "catboost"],
-            default=["lightgbm", "logreg"],
-        )
-        selection_metric = st.selectbox(
-            "Метрика выбора лучшей конфигурации",
-            ["pr_auc", "roc_auc", "brier", "base_max_profit"],
+        experiments = 1
+    elif preset == "balanced":
+        horizon = st.selectbox("Горизонт прогноза (дней)", [30, 60, 90], index=0)
+        default_history = {30: 180, 60: 180, 90: 365}[int(horizon)]
+        metric_key = st.selectbox(
+            "Метрика выбора лучшей модели",
+            options=list(METRIC_LABELS.keys()),
+            format_func=lambda k: METRIC_LABELS.get(k, k),
             index=0,
         )
-        enable_shap = st.checkbox("Добавить объяснения (SHAP) в отчёт", value=True)
-
+        selected_models_display = [format_model_kind("lightgbm"), format_model_kind("catboost"), format_model_kind("logreg")]
+        history_grid = sorted({int(default_history), 365 if int(default_history) < 365 else 180})
+        with st.expander("Тонкая настройка", expanded=False):
+            history_grid = st.multiselect("Окна истории", [90, 180, 365], default=history_grid) or history_grid
+            step_days = st.selectbox("Шаг точки отсчёта", [14, 30], index=1)
+            min_events_in_history = st.selectbox("Минимум событий в истории", [1, 2, 3], index=0)
+            calibration_grid = st.multiselect("Калибровка", ["sigmoid", "isotonic"], default=["sigmoid"]) or ["sigmoid"]
         params = {
-            "horizon_days_grid": horizons,
-            "history_days_grid": histories,
-            "step_days_grid": steps,
-            "model_kind_grid": models,
-            "selection_metric": selection_metric,
-            "calibration_grid": ["sigmoid", "isotonic"],
-            "min_events_in_history": 1,
+            "mode": "compare",
+            "model_name": model_name.strip(),
+            "horizon_days_grid": [int(horizon)],
+            "history_days_grid": [int(x) for x in history_grid],
+            "step_days_grid": [int(step_days)],
+            "model_kind_grid": ["lightgbm", "catboost", "logreg"],
+            "selection_metric": metric_key,
+            "calibration_grid": calibration_grid,
+            "min_events_in_history": int(min_events_in_history),
             "enable_shap": bool(enable_shap),
             "extra_feature_cols": state.extra_feature_cols or [],
+            "extra_feature_config": state.extra_feature_config or {},
         }
+        experiments = (
+            len(params["horizon_days_grid"])
+            * len(params["history_days_grid"])
+            * len(params["step_days_grid"])
+            * len(params["model_kind_grid"])
+            * len(params["calibration_grid"])
+        )
+    else:
+        st.caption("Выберите пространство экспериментов. Только этот режим показывает полный конструктор сравнения.")
+        horizons_grid = st.multiselect("Горизонты прогноза (дней)", [30, 60, 90], default=[30, 60]) or [30]
+        histories_grid = st.multiselect("Окна истории (дней)", [90, 180, 365], default=[180, 365]) or [180]
+        steps_grid = st.multiselect("Шаг точки отсчёта (дней)", [7, 14, 30], default=[30]) or [30]
+        metric_key = st.selectbox(
+            "Метрика выбора лучшей модели",
+            options=list(METRIC_LABELS.keys()),
+            format_func=lambda k: METRIC_LABELS.get(k, k),
+            index=0,
+        )
+        include_experimental = st.checkbox("Показывать экспериментальные модели", value=False)
+        model_options = [k for k in MODEL_KIND_LABELS.keys() if include_experimental or k != "mlp"]
+        model_defaults = ["lightgbm", "catboost", "logreg"]
+        selected_models = st.multiselect(
+            "Алгоритмы для сравнения",
+            options=model_options,
+            default=[m for m in model_defaults if m in model_options],
+            format_func=format_model_kind,
+        ) or [m for m in model_defaults if m in model_options]
+        with st.expander("Тонкая настройка", expanded=False):
+            calibration_grid = st.multiselect("Калибровка", ["sigmoid", "isotonic"], default=["sigmoid"]) or ["sigmoid"]
+            min_events_in_history = st.selectbox("Минимум событий в истории", [1, 2, 3], index=0)
 
-        st.caption("Что будет сделано: перебор параметров, сравнение, выбор лучшего bundle, полный отчёт.")
+        if "mlp" in selected_models:
+            st.warning(
+                "Нейронную сеть стоит использовать только на достаточно больших датасетах. "
+                "Для табличных данных бустинги часто оказываются сильнее и стабильнее."
+            )
+            if row_count and row_count < 10000:
+                st.warning("В вашем датасете строк пока немного для нейронной сети. Лучше оставить её как эксперимент.")
 
-    if st.button("Запустить обучение", type="primary"):
-        with st.spinner("Создаём job и запускаем обучение..."):
-            try:
-                resp = api.create_job(
-                    file_bytes=state.file_bytes,
-                    template=state.template,
-                    mapping=state.mapping,
-                    params=params,
-                )
-                state.job_id = resp["job_id"]
-                state.job_status = None
-                state.job_result = None
-                st.success(f"Job создан: {state.job_id}")
-            except Exception as e:
-                st.error(f"Не удалось создать job: {e}")
-                page_nav("Сопоставление", "Качество модели")
-                return
+        selected_models_display = [format_model_kind(m) for m in selected_models]
+        params = {
+            "mode": "compare",
+            "model_name": model_name.strip(),
+            "horizon_days_grid": [int(x) for x in horizons_grid],
+            "history_days_grid": [int(x) for x in histories_grid],
+            "step_days_grid": [int(x) for x in steps_grid],
+            "model_kind_grid": [str(x) for x in selected_models],
+            "selection_metric": metric_key,
+            "calibration_grid": calibration_grid,
+            "min_events_in_history": int(min_events_in_history),
+            "enable_shap": bool(enable_shap),
+            "extra_feature_cols": state.extra_feature_cols or [],
+            "extra_feature_config": state.extra_feature_config or {},
+        }
+        experiments = (
+            len(params["horizon_days_grid"])
+            * len(params["history_days_grid"])
+            * len(params["step_days_grid"])
+            * len(params["model_kind_grid"])
+            * len(params["calibration_grid"])
+        )
 
-    if not state.job_id:
-        st.info("Запустите обучение, чтобы увидеть статус.")
-        page_nav("Сопоставление", "Качество модели")
-        return
+    st.markdown("### Что система сделает")
+    st.write(f"**Модели:** {', '.join(selected_models_display)}")
+    st.write(f"**Метрика отбора:** {METRIC_LABELS.get(metric_key, metric_key)}")
+    st.write(f"**Оценка сложности запуска:** {_estimated_runtime_hint(experiments)}")
+    st.caption(f"Планируется обучить примерно {experiments} вариант(ов).")
 
-    st.subheader("Статус обучения")
-
-    if st.button("Обновить статус"):
+    if st.button("Запустить обучение", type="primary", use_container_width=True):
         try:
-            state.job_status = api.job_status(state.job_id)
+            resp = api.create_job(
+                file_bytes=state.working_file_bytes,
+                template=state.template,
+                mapping=state.mapping,
+                params=params,
+            )
+            state.job_id = resp["job_id"]
+            state.job_status = None
+            state.job_result = None
+            st.session_state["_job_just_started"] = True
+            st.rerun()
         except Exception as e:
-            st.error(f"Не удалось получить статус: {e}")
-            page_nav("Сопоставление", "Качество модели")
+            st.error(f"Не удалось запустить обучение: {e}")
             return
 
-    status = state.job_status
-    if not status:
-        status = api.job_status(state.job_id)
-        state.job_status = status
+    if not state.job_id:
+        st.info("После запуска здесь появится прогресс.")
+        page_nav(STEP_2_ANALYTICS, STEP_4_QUALITY, next_disabled_reason="Сначала запустите обучение.")
+        return
 
-    st.json(status)
+    try:
+        state.job_status = api.job_status(state.job_id)
+    except Exception as e:
+        st.error(f"Не удалось получить статус: {e}")
+        page_nav(STEP_2_ANALYTICS, STEP_4_QUALITY, next_disabled_reason="Статус обучения пока недоступен.")
+        return
+
+    status = state.job_status or {}
+    if status.get("status") not in ("done", "failed"):
+        schedule_autorefresh(2500, key="training_job_poll")
+
+    st.markdown("### Прогресс")
+    progress = int(status.get("progress") or 0)
+    raw_stage = status.get("stage", "ожидание")
+    stage = _stage_label(str(raw_stage))
+    st.progress(min(max(progress, 0), 100), text=f"{progress}% — {stage}")
+
+    extra = status.get("extra")
+    if extra and isinstance(extra, dict) and extra.get("experiment"):
+        st.caption(f"Сейчас: вариант «{extra.get('experiment')}»")
 
     if status.get("status") == "done":
-        st.success("Обучение завершено.")
-
+        st.success("Обучение завершено. Перейдите к шагу «Качество и сравнение».")
         try:
             state.job_result = api.job_result(state.job_id)
         except Exception as e:
-            st.error(f"Не удалось получить результат job: {e}")
-            page_nav("Сопоставление", "Качество модели")
+            st.error(f"Не удалось загрузить итог: {e}")
+            page_nav(STEP_2_ANALYTICS, STEP_4_QUALITY, next_disabled_reason="Сначала дождитесь корректного завершения обучения.")
             return
 
-        st.write("Скачать артефакты (zip):")
-        st.write(f"{api.base_url}/jobs/{state.job_id}/download")
+        result = state.job_result or {}
+        saved_params = result.get("params_used") or {}
+        display_name = saved_params.get("model_name") or model_name.strip()
 
-        st.write("Результат (кратко):")
-        st.json(
-            {
-                k: state.job_result.get(k)
-                for k in [
-                    "mode",
-                    "template",
-                    "test_metrics_cal",
-                    "business_metrics",
-                    "suitability",
-                ]
-                if k in state.job_result
-            }
-        )
+        st.markdown("### Итог")
+        st.write(f"**Название:** {display_name}")
+        st.write(f"**Тип данных:** {result.get('template', state.template)}")
+        algo = saved_params.get("model_kind")
+        if algo:
+            st.write(f"**Алгоритм:** {format_model_kind(str(algo))}")
+        hz = saved_params.get("horizon_days")
+        if hz is not None:
+            st.write(f"**Горизонт (дней):** {hz}")
 
-        if st.button("Перейти к качеству модели", use_container_width=True):
-            st.session_state["current_step"] = "Качество модели"
-            st.rerun()
+        if result.get("mode") == "grid_search":
+            nexp = result.get("n_experiments")
+            if nexp is not None:
+                st.write(f"**Сравнено вариантов:** {nexp}")
+            sm = result.get("selection_metric")
+            if sm:
+                st.write(f"**Метрика выбора лучшего:** {METRIC_LABELS.get(str(sm), sm)}")
+
+        with st.expander("Скачать архив с отчётами (ссылка для браузера)"):
+            st.markdown(f"[Открыть загрузку отчёта]({api.base_url}/jobs/{state.job_id}/download)")
 
     elif status.get("status") == "failed":
-        st.error(f"Ошибка обучения: {status.get('error')}")
-    else:
-        st.warning("Обучение ещё идёт (или в очереди).")
+        st.error(f"Обучение остановилось с ошибкой: {status.get('error')}")
+        page_nav(STEP_2_ANALYTICS, STEP_4_QUALITY, next_disabled_reason="Исправьте ошибку и перезапустите обучение.")
+        return
 
-    page_nav("Сопоставление", "Качество модели")
+    page_nav(STEP_2_ANALYTICS, STEP_4_QUALITY)

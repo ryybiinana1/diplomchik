@@ -22,4 +22,3 @@ services:
       - api
     volumes:
       - ./ui:/app/ui
-      - ./app:/app/app

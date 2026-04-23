@@ -1,7 +1,7 @@
 # churnlib/feature_module.py
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -22,6 +22,7 @@ def aggregate_extra_features(
     id_col: str,
     time_col: str,
     extra_cols: List[str],
+    extra_feature_config: Optional[Dict[str, Dict[str, Any]]],
     anchor_time: pd.Timestamp,
     prefix: str = "extra",
     max_cols: int = 20,
@@ -39,8 +40,11 @@ def aggregate_extra_features(
     df_sorted = df.sort_values(time_col).copy()
 
     out_parts = []
+    extra_feature_config = extra_feature_config or {}
+
     for col in extra_cols:
         s = df[col]
+        col_cfg = extra_feature_config.get(col) or {}
 
         # 1) пробуем datetime
         dt = pd.to_datetime(s, errors="coerce", utc=True)
@@ -88,7 +92,7 @@ def aggregate_extra_features(
             out_parts.append(agg)
             continue
 
-        # 3) categorical → только числовые summary
+        # 3) categorical → либо one-hot по top values, либо компактное кодирование
         cat = s.astype(str)
         cat = cat.replace("nan", np.nan).fillna("NA")
 
@@ -110,6 +114,47 @@ def aggregate_extra_features(
         miss = df[col].isna().groupby(df[id_col]).mean().rename(f"{prefix}__{col}__missing_share")
 
         agg = pd.concat([nunique, ent_s, top1_s, miss], axis=1)
+
+        encoding = str(col_cfg.get("encoding") or "label")
+        top_values = [str(v) for v in (col_cfg.get("top_values") or [])]
+        if encoding == "onehot" and top_values:
+            safe = df[[id_col, col]].copy().fillna("NA")
+            safe[col] = safe[col].astype(str)
+            last_values = (
+                df_sorted[[id_col, col]]
+                .copy()
+                .fillna("NA")
+                .groupby(id_col)[col]
+                .last()
+                .astype(str)
+            )
+            for raw_value in top_values:
+                key = str(raw_value)
+                suffix = "".join(ch if ch.isalnum() else "_" for ch in key.lower()).strip("_")[:24] or "value"
+                share = (
+                    (safe[col] == key)
+                    .groupby(safe[id_col])
+                    .mean()
+                    .rename(f"{prefix}__{col}__share_{suffix}")
+                )
+                last_is = (
+                    (last_values == key)
+                    .astype(float)
+                    .rename(f"{prefix}__{col}__last_is_{suffix}")
+                )
+                agg = pd.concat([agg, share, last_is], axis=1)
+        else:
+            vocab = {value: idx for idx, value in enumerate(top_values, start=1)}
+            tmp = df[[id_col, col]].copy().fillna("NA")
+            tmp[col] = tmp[col].astype(str).map(lambda x: vocab.get(x, 0)).astype(float)
+            code_stats = tmp.groupby(id_col)[col].agg(["mean", "max", "last"]).rename(
+                columns={
+                    "mean": f"{prefix}__{col}__code_mean",
+                    "max": f"{prefix}__{col}__code_max",
+                    "last": f"{prefix}__{col}__code_last",
+                }
+            )
+            agg = pd.concat([agg, code_stats], axis=1)
         out_parts.append(agg)
 
     out = pd.concat(out_parts, axis=1)
@@ -121,6 +166,7 @@ def build_transaction_features(
     df: pd.DataFrame,
     anchor_time: pd.Timestamp,
     extra_feature_cols: Optional[List[str]] = None,
+    extra_feature_config: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> pd.DataFrame:
     """
     Строит RFM‑подобные признаки по транзакциям.
@@ -203,6 +249,7 @@ def build_transaction_features(
             id_col="customer_id",
             time_col="event_time",
             extra_cols=list(extra_feature_cols),
+            extra_feature_config=extra_feature_config,
             anchor_time=anchor_time,
             prefix="extra",
             max_cols=20,

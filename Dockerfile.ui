@@ -2,10 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY reqirements.txt /app/reqirements.txt
-RUN pip install --no-cache-dir -r /app/reqirements.txt
+# Лёгкий образ: без catboost/lightgbm/shap — обучение идёт в сервисе api
+COPY requirements-ui.txt /app/requirements-ui.txt
+RUN pip install --no-cache-dir -U pip \
+    && pip install --no-cache-dir -r /app/requirements-ui.txt
 
-COPY . /app
+COPY ui /app/ui
 
 ENV PYTHONPATH=/app
 
