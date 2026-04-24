@@ -112,19 +112,41 @@ class ApiClient:
         r.raise_for_status()
         return r.json()
 
+    def download_job_artifact(self, job_id: str, artifact_key: str) -> bytes:
+        r = self.session.get(f"{self.base_url}/jobs/{job_id}/artifacts/{artifact_key}", timeout=600)
+        r.raise_for_status()
+        return r.content
+
+    def download_job_report(self, job_id: str) -> bytes:
+        r = self.session.get(f"{self.base_url}/jobs/{job_id}/download", timeout=600)
+        r.raise_for_status()
+        return r.content
+
     def list_models(self) -> Dict[str, Any]:
         r = self.session.get(f"{self.base_url}/models", timeout=60)
         r.raise_for_status()
         return r.json()
 
-    def start_score(self, file_bytes: bytes, bundle_dir: str, score_mapping: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def start_score(
+        self,
+        file_bytes: bytes,
+        bundle_dir: str,
+        score_mapping: Dict[str, Any] | None = None,
+        scenario_params: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         files = {"file": ("score.csv", file_bytes, "text/csv")}
         data = {
             "bundle_dir": bundle_dir,
             "score_mapping_json": json.dumps(_json_safe(_normalize_mapping_columns(score_mapping or {})), ensure_ascii=False),
+            "scenario_params_json": json.dumps(_json_safe(scenario_params or {}), ensure_ascii=False),
         }
         r = self.session.post(f"{self.base_url}/score", files=files, data=data, timeout=120)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text or r.reason
+            raise RuntimeError(f"{r.status_code}: {detail}") from None
         return r.json()
 
     def score_schema_check(
@@ -139,7 +161,12 @@ class ApiClient:
             "score_mapping_json": json.dumps(_json_safe(_normalize_mapping_columns(score_mapping or {})), ensure_ascii=False),
         }
         r = self.session.post(f"{self.base_url}/score/schema-check", files=files, data=data, timeout=120)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text or r.reason
+            raise RuntimeError(f"{r.status_code}: {detail}") from None
         return r.json()
 
     def score_job_status(self, score_id: str) -> Dict[str, Any]:
@@ -154,5 +181,10 @@ class ApiClient:
 
     def download_score_csv(self, score_id: str) -> bytes:
         r = self.session.get(f"{self.base_url}/scores/{score_id}/download", timeout=600)
+        r.raise_for_status()
+        return r.content
+
+    def download_score_artifact(self, score_id: str, artifact_name: str) -> bytes:
+        r = self.session.get(f"{self.base_url}/scores/{score_id}/artifacts/{artifact_name}", timeout=600)
         r.raise_for_status()
         return r.content

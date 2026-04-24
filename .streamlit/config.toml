@@ -1,0 +1,8 @@
+# Конфиг читается из рабочей директории Streamlit (в Docker: /app).
+# Том ./.streamlit:/app/.streamlit в docker-compose должен совпадать с этой папкой.
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

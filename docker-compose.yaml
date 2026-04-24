@@ -22,3 +22,4 @@ services:
       - api
     volumes:
       - ./ui:/app/ui
+      - ./.streamlit:/app/.streamlit

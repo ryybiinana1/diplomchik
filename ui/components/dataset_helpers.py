@@ -14,6 +14,37 @@ def is_textual(series: pd.Series) -> bool:
     return series.dtype == "object" or str(series.dtype).startswith("string")
 
 
+def _looks_like_datetime_name(name: str) -> bool:
+    low = str(name).lower()
+    return any(token in low for token in ["date", "time", "timestamp", "datetime", "period", "дата", "время"])
+
+
+def _datetime_parse_share(series: pd.Series, col_name: str) -> float:
+    """
+    Быстрая оценка доли дат:
+    - не пытаемся парсить весь столбец каждый раз;
+    - парсим только небольшой sample для текстовых колонок.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return 1.0
+
+    if pd.api.types.is_numeric_dtype(series):
+        return 0.0
+
+    s = series.dropna()
+    if s.empty:
+        return 0.0
+
+    sample_size = min(200, len(s))
+    sample = s.astype(str).head(sample_size)
+    if not _looks_like_datetime_name(col_name):
+        # Для неочевидных колонок вообще не делаем тяжёлый dateutil parse:
+        # это главный источник лагов и предупреждений.
+        return 0.0
+    dt = pd.to_datetime(sample, errors="coerce")
+    return float(dt.notna().mean())
+
+
 def _sample_values(series: pd.Series, limit: int = 4) -> list[str]:
     values = series.dropna().astype(str).head(limit).tolist()
     return [v[:60] for v in values]
@@ -35,8 +66,7 @@ def profile_extra_column(df: pd.DataFrame, col: str) -> dict[str, Any]:
     dtype_name = str(s.dtype)
     num = pd.to_numeric(s, errors="coerce")
     num_share = float(num.notna().mean())
-    dt = pd.to_datetime(s, errors="coerce")
-    dt_share = float(dt.notna().mean())
+    dt_share = _datetime_parse_share(s, col)
     samples = _sample_values(s)
 
     if pd.api.types.is_numeric_dtype(s) or num_share >= 0.9:

@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -U pip \
     && pip install --no-cache-dir -r /app/requirements-ui.txt
 
 COPY ui /app/ui
+COPY .streamlit /app/.streamlit
 
 ENV PYTHONPATH=/app
 

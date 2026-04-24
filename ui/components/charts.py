@@ -25,7 +25,7 @@ def _trim_numeric_series(series: pd.Series, upper_q: float = 0.99) -> pd.Series:
     return s.clip(upper=upper)
 
 
-def _figure(figsize: tuple[float, float] = (10.5, 4.8)):
+def _figure(figsize: tuple[float, float] = (8.8, 4.8)):
     if plt is None:
         return None, None
     fig, ax = plt.subplots(figsize=figsize)
@@ -75,7 +75,7 @@ def render_bar_chart(
             fallback = pd.Series(series.values, index=data[x_col].astype(str))
             st.bar_chart(fallback, width="stretch")
         return
-    fig, ax = _figure((11, max(4.2, min(height / 72.0, 7.0))))
+    fig, ax = _figure((8.6, max(4.2, min(height / 72.0, 6.6))))
     if horizontal:
         ax.barh(data[x_col].astype(str), pd.to_numeric(data[y_col], errors="coerce").fillna(0), color=color)
         _finalize_plot(fig, ax, title=title, x_title=y_title, y_title=x_title)
@@ -105,7 +105,7 @@ def render_line_chart(
         fallback = pd.DataFrame({y_col: pd.to_numeric(data[y_col], errors="coerce").fillna(0).values}, index=data[x_col])
         st.line_chart(fallback, width="stretch")
         return
-    fig, ax = _figure((11, max(4.2, min(height / 72.0, 6.5))))
+    fig, ax = _figure((8.4, max(4.2, min(height / 72.0, 6.2))))
     x = data[x_col]
     y = pd.to_numeric(data[y_col], errors="coerce").fillna(0)
     ax.plot(x, y, marker="o", color=color, linewidth=2)

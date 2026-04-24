@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+from io import BytesIO
 import json
 
 import pandas as pd
@@ -8,6 +8,7 @@ import streamlit as st
 
 from ui.api_client import ApiClient
 from ui.components.charts import plot_experiment_scores, render_bar_chart, render_line_chart
+from ui.components.layout import render_page_header, section_card
 from ui.poll_rerun import schedule_autorefresh
 from ui.components.nav import page_nav
 from ui.components.status_cards import metric_card_row
@@ -22,6 +23,47 @@ def _safe_metric(x) -> str:
         return "—"
 
 
+def _safe_money(x) -> str:
+    try:
+        return f"{float(x):,.2f}".replace(",", " ")
+    except Exception:
+        return "—"
+
+
+def _metric_float(x) -> float | None:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _quality_verdict(metrics: dict, business_metrics: dict) -> tuple[str, str]:
+    pr_auc = _metric_float(metrics.get("pr_auc"))
+    roc_auc = _metric_float(metrics.get("roc_auc"))
+    f1 = _metric_float(metrics.get("f1"))
+    max_profit = _metric_float(business_metrics.get("base_max_profit"))
+
+    if pr_auc is not None and roc_auc is not None and pr_auc >= 0.65 and roc_auc >= 0.75:
+        return (
+            "Модель выглядит достаточно сильной для практического пилота.",
+            "Качество по ключевым метрикам уверенное, поэтому можно переходить к приоритизации клиентов и проверке эффекта на кампании удержания.",
+        )
+    if (pr_auc is not None and pr_auc >= 0.5) or (roc_auc is not None and roc_auc >= 0.7) or (f1 is not None and f1 >= 0.45):
+        profit_tail = (
+            f" Базовый сценарий даёт ожидаемый эффект до {_safe_money(max_profit)}."
+            if max_profit is not None
+            else ""
+        )
+        return (
+            "Модель можно использовать как рабочий baseline.",
+            "Есть сигнал для отбора клиентов, но решение лучше принимать вместе с экономикой, а не только по вероятности оттока." + profit_tail,
+        )
+    return (
+        "Модель стоит использовать осторожно.",
+        "Метрики пока скорее подходят для исследовательского режима: сначала лучше проверить данные, сценарий удержания и устойчивость эффекта на пилоте.",
+    )
+
+
 def _parse_metrics_blob(value) -> dict:
     if isinstance(value, dict):
         return dict(value)
@@ -33,11 +75,53 @@ def _parse_metrics_blob(value) -> dict:
     return {}
 
 
+def _read_job_csv(api: ApiClient, job_id: str, artifact_key: str) -> pd.DataFrame:
+    data = api.download_job_artifact(job_id, artifact_key)
+    return pd.read_csv(BytesIO(data))
+
+
+def _pick_priority_label_col(df: pd.DataFrame) -> str:
+    for candidate in ("entity_id", "customer_id", "client_id", "account_id", "user_id"):
+        if candidate in df.columns:
+            return candidate
+    non_numeric = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+    return non_numeric[0] if non_numeric else ""
+
+
+def _priority_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    for col in ("p", "p_cal", "p_raw", "EV_base", "value_proxy", "target"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    display_cols = [
+        c
+        for c in ("entity_id", "customer_id", "client_id", "account_id", "user_id", "p", "EV_base", "value_proxy", "target")
+        if c in out.columns
+    ]
+    if not display_cols:
+        display_cols = list(out.columns[: min(8, len(out.columns))])
+    return out[display_cols].rename(
+        columns={
+            "entity_id": "Объект",
+            "customer_id": "Клиент",
+            "client_id": "Клиент",
+            "account_id": "Аккаунт",
+            "user_id": "Пользователь",
+            "p": "Вероятность оттока",
+            "EV_base": "Ожидаемый эффект",
+            "value_proxy": "Ценность",
+            "target": "Факт target",
+        }
+    )
+
+
 def page():
-    st.title("Качество и сравнение моделей")
-    st.caption(
-        "Метрики итоговой модели, кривые ошибок и при сравнении нескольких вариантов — таблица всех прогонов. "
-        "Итоговая модель совпадает с лучшим вариантом по выбранной метрике."
+    render_page_header(
+        "Качество и сравнение моделей",
+        "Здесь собраны метрики итоговой модели, кривые ошибок и при сравнении нескольких вариантов таблица всех прогонов.",
+        eyebrow="Шаг 4",
     )
 
     api = ApiClient.from_env()
@@ -87,19 +171,23 @@ def page():
         if k in quality:
             test_metrics[k] = quality[k]
     params_used = result.get("params_used", {})
+    business_metrics = result.get("business_metrics") or {}
 
     artifacts = result.get("artifacts") or {}
     best_bundle = artifacts.get("bundle_dir") or (artifacts.get("bundle") or {}).get("bundle_dir")
 
     comparison_df = pd.DataFrame()
+    comparison_table = pd.DataFrame()
+    comparison_selection_label = None
+    comparison_error = None
+    winner_summary = None
     if result.get("mode") == "grid_search":
-        st.markdown("### Сравнение вариантов")
         try:
             exp = api.job_experiments(state.job_id)
             rows = exp.get("rows") or []
             sm = exp.get("selection_metric") or result.get("selection_metric")
             if sm:
-                st.write(f"**Метрика для выбора лучшего варианта:** {METRIC_LABELS.get(str(sm), sm)}")
+                comparison_selection_label = METRIC_LABELS.get(str(sm), sm)
 
             if rows:
                 edf = pd.DataFrame(rows)
@@ -152,17 +240,16 @@ def page():
                 )
                 if "Статус" in sub.columns:
                     sub["Статус"] = sub["Статус"].map({"ok": "Успех", "failed": "Ошибка"}).fillna(sub["Статус"])
-
-                only_success = st.checkbox("Показывать только успешные варианты", value=True)
-                filtered = sub[sub["Статус"] == "Успех"].copy() if only_success and "Статус" in sub.columns else sub
-                st.dataframe(filtered, width="stretch", hide_index=True)
-                if "Оценка отбора" in filtered.columns:
-                    chart_df = filtered.rename(columns={"Вариант": "label", "Оценка отбора": "score"})
-                    plot_experiment_scores(chart_df, "label", "score", "Лидерборд по метрике отбора")
-            else:
-                st.info("Таблица сравнения пуста.")
+                comparison_table = sub.copy()
+                successful = comparison_df[comparison_df["status"] == "ok"].copy() if "status" in comparison_df.columns else comparison_df
+                if not successful.empty:
+                    winner = successful[successful["bundle_dir"].astype(str) == str(best_bundle)].head(1)
+                    if winner.empty:
+                        winner = successful.sort_values("score", ascending=False).head(1)
+                    if not winner.empty:
+                        winner_summary = winner.iloc[0].to_dict()
         except Exception as e:
-            st.warning(f"Не удалось загрузить таблицу сравнения: {e}")
+            comparison_error = str(e)
 
     if not test_metrics:
         st.warning("Числовые метрики для итоговой модели пока недоступны.")
@@ -171,37 +258,86 @@ def page():
         page_nav(STEP_3_TRAIN, STEP_5_FORECAST)
         return
 
-    st.markdown("### Лучшая итоговая модель")
-    metric_card_row(
-        [
-            ("Точность (Precision)", _safe_metric(test_metrics.get("precision"))),
-            ("Полнота (Recall)", _safe_metric(test_metrics.get("recall"))),
-            ("F1", _safe_metric(test_metrics.get("f1"))),
-            ("ROC-AUC", _safe_metric(test_metrics.get("roc_auc"))),
-            ("PR-AUC", _safe_metric(test_metrics.get("pr_auc"))),
-        ]
-    )
+    verdict_title, verdict_note = _quality_verdict(test_metrics, business_metrics)
 
-    st.markdown("### Параметры итоговой модели")
-    st.write(f"**Название:** {params_used.get('model_name', '—')}")
-    st.write(f"**Тип данных:** {result.get('template', '—')}")
-    mk = params_used.get("model_kind")
-    st.write(f"**Алгоритм:** {format_model_kind(str(mk))}")
-    st.write(f"**Горизонт (дней):** {params_used.get('horizon_days', '—')}")
-    st.write(f"**Окно истории (дней):** {params_used.get('history_days', '—')}")
+    with section_card("Управленческий вывод", "Короткая выжимка для принятия решения перед переходом к прогнозу."):
+        top_k = business_metrics.get("base_best_k")
+        max_profit = business_metrics.get("base_max_profit")
+        metric_card_row(
+            [
+                ("PR-AUC", _safe_metric(test_metrics.get("pr_auc"))),
+                ("ROC-AUC", _safe_metric(test_metrics.get("roc_auc"))),
+                ("Рекомендуемый top-k", str(top_k) if top_k is not None else "—"),
+                ("Макс. эффект", _safe_money(max_profit)),
+            ]
+        )
+        st.write(f"**Вывод:** {verdict_title}")
+        st.caption(verdict_note)
+
+    with section_card("Лучшая итоговая модель", "Ключевые метрики уже откалиброванной итоговой модели."):
+        metric_card_row(
+            [
+                ("Точность (Precision)", _safe_metric(test_metrics.get("precision"))),
+                ("Полнота (Recall)", _safe_metric(test_metrics.get("recall"))),
+                ("F1", _safe_metric(test_metrics.get("f1"))),
+                ("ROC-AUC", _safe_metric(test_metrics.get("roc_auc"))),
+                ("PR-AUC", _safe_metric(test_metrics.get("pr_auc"))),
+            ]
+        )
+
+    with section_card("Параметры итоговой модели", "Эта сводка помогает быстро понять, что именно было выбрано системой."):
+        st.write(f"**Название:** {params_used.get('model_name', '—')}")
+        st.write(f"**Тип данных:** {result.get('template', '—')}")
+        mk = params_used.get("model_kind")
+        st.write(f"**Алгоритм:** {format_model_kind(str(mk))}")
+        st.write(f"**Горизонт (дней):** {params_used.get('horizon_days', '—')}")
+        st.write(f"**Окно истории (дней):** {params_used.get('history_days', '—')}")
+        if result.get("mode") == "grid_search":
+            st.caption("Это лучший вариант среди всех протестированных моделей по выбранной метрике отбора.")
+
+    if winner_summary:
+        with section_card("Итог сравнения", "Короткая выжимка по лучшему варианту среди всех успешно обученных моделей."):
+            metric_card_row(
+                [
+                    ("Успешных вариантов", str(int((comparison_df["status"] == "ok").sum())) if "status" in comparison_df.columns else "—"),
+                    ("Метрика отбора", _safe_metric(winner_summary.get("score"))),
+                    ("PR-AUC лучшего", _safe_metric(winner_summary.get("pr_auc"))),
+                    ("ROC-AUC лучшего", _safe_metric(winner_summary.get("roc_auc"))),
+                ]
+            )
+            st.write(f"**Алгоритм лучшего варианта:** {format_model_kind(str(winner_summary.get('model_kind')))}")
+
     if result.get("mode") == "grid_search":
-        st.caption("Это лучший вариант среди всех протестированных моделей по выбранной метрике отбора.")
+        with section_card("Все протестированные варианты", "Полная таблица сравнения нужна скорее для аналитика, чем для руководителя."):
+            if comparison_selection_label:
+                st.write(f"**Метрика выбора лучшего варианта:** {comparison_selection_label}")
+            if comparison_error:
+                st.warning(f"Не удалось загрузить таблицу сравнения: {comparison_error}")
+            elif comparison_table.empty:
+                st.info("Таблица сравнения пуста.")
+            else:
+                only_success = st.checkbox("Показывать только успешные варианты", value=True)
+                filtered = (
+                    comparison_table[comparison_table["Статус"] == "Успех"].copy()
+                    if only_success and "Статус" in comparison_table.columns
+                    else comparison_table
+                )
+                with st.expander("Открыть подробную таблицу сравнения", expanded=False):
+                    st.dataframe(filtered, width="stretch", hide_index=True)
+                if "Оценка отбора" in filtered.columns:
+                    chart_df = filtered.rename(columns={"Вариант": "label", "Оценка отбора": "score"})
+                    plot_experiment_scores(chart_df, "label", "score", "Лидерборд по метрике отбора")
 
     roc = quality.get("roc_curve", {})
     pr = quality.get("pr_curve", {})
     cm = quality.get("confusion_matrix")
     class_counts = result.get("class_counts") or {}
     target_rate = result.get("target_rate")
-    business_metrics = result.get("business_metrics") or {}
+    business_scenario = business_metrics.get("scenario") or {}
     walk_forward = result.get("walk_forward") or {}
 
-    tab_metrics, tab_curves, tab_data, tab_econ, tab_stability = st.tabs(
-        ["Метрики", "Кривые", "Target и данные", "Экономика", "Стабильность"]
+    tab_metrics, tab_econ, tab_curves, tab_data, tab_stability = st.tabs(
+        ["Метрики", "Экономика", "Кривые", "Target и данные", "Стабильность"]
     )
 
     with tab_metrics:
@@ -287,10 +423,9 @@ def page():
             st.dataframe(cm_df, width="stretch")
 
     with tab_stability:
-        psi_path = artifacts.get("feature_psi_csv")
-        if psi_path and Path(str(psi_path)).exists():
+        if artifacts.get("feature_psi_csv"):
             try:
-                psi_df = pd.read_csv(str(psi_path))
+                psi_df = _read_job_csv(api, state.job_id, "feature_psi_csv")
                 if not psi_df.empty:
                     st.markdown("#### Стабильность признаков (PSI, топ)")
                     if {"feature", "psi"}.issubset(set(psi_df.columns)):
@@ -310,10 +445,9 @@ def page():
             except Exception as e:
                 st.info(f"Не удалось прочитать feature_psi.csv: {e}")
 
-        folds_csv = walk_forward.get("folds_csv")
-        if folds_csv and Path(str(folds_csv)).exists():
+        if walk_forward.get("folds_csv"):
             try:
-                folds_df = pd.read_csv(str(folds_csv))
+                folds_df = _read_job_csv(api, state.job_id, "walk_forward_folds")
                 if not folds_df.empty:
                     st.markdown("#### Walk-forward по фолдам")
                     st.dataframe(folds_df, width="stretch", hide_index=True)
@@ -325,23 +459,54 @@ def page():
         c1.metric("Оптимальный top-k", str(business_metrics.get("base_best_k", "—")))
         bm_profit = business_metrics.get("base_max_profit")
         c2.metric("Макс. ожидаемая прибыль", "—" if bm_profit is None else f"{float(bm_profit):,.2f}".replace(",", " "))
+        if business_scenario:
+            st.caption(
+                "Сценарий удержания: "
+                f"margin={float(business_scenario.get('margin', 0)):.2f}, "
+                f"cost={float(business_scenario.get('cost', 0)):.2f}, "
+                f"success={float(business_scenario.get('success', 0)):.2f}"
+            )
 
-        profit_plot = artifacts.get("profit_plot")
-        if profit_plot and Path(str(profit_plot)).exists():
-            st.markdown("#### Кривая экономического эффекта")
-            st.image(str(profit_plot), width="stretch")
+        if artifacts.get("profit_plot"):
+            try:
+                st.markdown("#### Кривая экономического эффекта")
+                st.image(api.download_job_artifact(state.job_id, "profit_plot"), width="stretch")
+            except Exception as e:
+                st.info(f"График экономического эффекта недоступен: {e}")
         else:
             st.info("График экономического эффекта недоступен.")
 
-        profit_summary = artifacts.get("profit_summary")
-        if profit_summary and Path(str(profit_summary)).exists():
+        if artifacts.get("profit_summary"):
             try:
-                ps_df = pd.read_csv(str(profit_summary))
+                ps_df = _read_job_csv(api, state.job_id, "profit_summary")
                 if not ps_df.empty:
                     st.markdown("#### Сводка по сценариям")
                     st.dataframe(ps_df, width="stretch", hide_index=True)
             except Exception as e:
                 st.info(f"Не удалось прочитать profit_summary.csv: {e}")
+
+        if artifacts.get("priority_csv"):
+            try:
+                prio_df = _read_job_csv(api, state.job_id, "priority_csv")
+                if not prio_df.empty:
+                    st.markdown("#### Топ клиентов, которых стоит удерживать")
+                    label_col = _pick_priority_label_col(prio_df)
+                    if label_col and "EV_base" in prio_df.columns:
+                        top_chart = prio_df.head(15).copy()
+                        top_chart["_label"] = top_chart[label_col].astype(str)
+                        render_bar_chart(
+                            top_chart,
+                            x_col="_label",
+                            y_col="EV_base",
+                            title="Лидеры по ожидаемому эффекту удержания",
+                            x_title="Клиент",
+                            y_title="Ожидаемый эффект",
+                            horizontal=True,
+                            height=420,
+                        )
+                    st.dataframe(_priority_table(prio_df.head(25)), width="stretch", hide_index=True)
+            except Exception as e:
+                st.info(f"Не удалось прочитать priority_list_topk.csv: {e}")
 
     st.success(
         "Эта модель сохранена как итоговая и доступна на шаге «Прогноз» для оценки новых клиентов."

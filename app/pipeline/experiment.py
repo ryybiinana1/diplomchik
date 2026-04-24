@@ -15,7 +15,7 @@ from churnlib.calibration_module import CalibrationConfig, calibrate, save_calib
 from churnlib.cards_module import write_datasheet, write_model_card
 from churnlib.data_module import SnapshotConfig, build_snapshots, canonicalize_types
 from churnlib.drift_module import compute_feature_psi
-from churnlib.economy_module import DEFAULT_SCENARIOS
+from churnlib.economy_module import build_scenarios, scenario_from_params
 from churnlib.explain_module import ExplainConfig, shap_explain_global, save_shap_artifacts
 from churnlib.model_module import TrainConfig, train_time_cv, walk_forward_backtest
 from churnlib.report_module import ReportConfig, write_docx_report, write_reports
@@ -212,10 +212,11 @@ def run_single_experiment(
         psi_path = None
 
     rep_cfg = ReportConfig(out_dir=str(out_dir), top_k=int(params.get("top_k_priority", 500)))
+    business_scenario = scenario_from_params(params)
     business_rep = write_reports(
         df_test=train_res["test_df"],
         p=np.asarray(cal_res["p_cal"], dtype=float),
-        scenarios=list(DEFAULT_SCENARIOS),
+        scenarios=build_scenarios(params),
         cfg=rep_cfg,
     )
 
@@ -290,6 +291,11 @@ def run_single_experiment(
                 "business_metrics": {
                     "base_best_k": business_rep.get("base_best_k"),
                     "base_max_profit": business_rep.get("base_max_profit"),
+                    "scenario": {
+                        "margin": business_scenario.margin,
+                        "cost": business_scenario.cost,
+                        "success": business_scenario.success,
+                    },
                 },
             },
             artifact_paths={
@@ -323,6 +329,11 @@ def run_single_experiment(
                 "business_metrics": {
                     "base_best_k": business_rep.get("base_best_k"),
                     "base_max_profit": business_rep.get("base_max_profit"),
+                    "scenario": {
+                        "margin": business_scenario.margin,
+                        "cost": business_scenario.cost,
+                        "success": business_scenario.success,
+                    },
                 },
             },
             extra_feature_audit=extra_audit,
@@ -370,6 +381,11 @@ def run_single_experiment(
         "business_metrics": {
             "base_best_k": business_rep.get("base_best_k"),
             "base_max_profit": business_rep.get("base_max_profit"),
+            "scenario": {
+                "margin": business_scenario.margin,
+                "cost": business_scenario.cost,
+                "success": business_scenario.success,
+            },
         },
         "suitability": suitability,
         "extra_feature_audit": extra_audit,

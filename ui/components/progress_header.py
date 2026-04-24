@@ -20,15 +20,14 @@ def render_progress_header(current_step: str, state) -> None:
         STEP_4_QUALITY: bool(state.job_result),
         STEP_5_FORECAST: bool(state.score_result) or bool(state.score_id),
     }
-    cols = st.columns(5)
-    for col, step in zip(cols, [STEP_1_DATA, STEP_2_ANALYTICS, STEP_3_TRAIN, STEP_4_QUALITY, STEP_5_FORECAST]):
+    labels = []
+    for step in [STEP_1_DATA, STEP_2_ANALYTICS, STEP_3_TRAIN, STEP_4_QUALITY, STEP_5_FORECAST]:
+        label = STEP_NAV_SHORT.get(step, step)
         if step == current_step:
-            marker = "Текущий шаг"
+            labels.append(f"**{label}**")
         elif statuses.get(step):
-            marker = "Готово"
+            labels.append(f"{label} · готово")
         else:
-            marker = "Ожидание"
-        with col:
-            with st.container(border=True):
-                st.caption(STEP_NAV_SHORT.get(step, step))
-                st.markdown(f"**{marker}**")
+            labels.append(f"{label} · далее")
+
+    st.caption("Этапы работы: " + "  |  ".join(labels))

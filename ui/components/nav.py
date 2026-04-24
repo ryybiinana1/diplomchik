@@ -14,34 +14,39 @@ def page_nav(
 ) -> None:
     """Единый блок перехода между шагами."""
     st.markdown("---")
-    st.caption("Переход между разделами")
+    with st.container(border=True):
+        st.caption("Переход между разделами")
 
-    left, right = st.columns(2, gap="medium")
+        left, right = st.columns(2, gap="medium")
 
-    with left:
-        if prev_step:
-            label = STEP_NAV_SHORT.get(prev_step, prev_step)
-            if st.button(
-                f"← {label}",
-                key=f"nav_prev_{prev_step}_{next_step}",
-                type="secondary",
-                use_container_width=True,
-            ):
-                set_current_step(prev_step)
-                st.rerun()
+        with left:
+            if prev_step:
+                label = STEP_NAV_SHORT.get(prev_step, prev_step)
+                if st.button(
+                    f"← {label}",
+                    key=f"nav_prev_{prev_step}_{next_step}",
+                    type="secondary",
+                    use_container_width=True,
+                ):
+                    set_current_step(prev_step)
+                    st.rerun()
+            else:
+                st.caption("Это первый шаг сценария.")
 
-    with right:
-        if next_step:
-            label = STEP_NAV_SHORT.get(next_step, next_step)
-            disabled = bool(next_disabled_reason)
-            if st.button(
-                f"{label} →",
-                key=f"nav_next_{prev_step}_{next_step}",
-                type="secondary",
-                use_container_width=True,
-                disabled=disabled,
-            ):
-                set_current_step(next_step)
-                st.rerun()
-            if disabled:
-                st.caption(next_disabled_reason)
+        with right:
+            if next_step:
+                label = STEP_NAV_SHORT.get(next_step, next_step)
+                disabled = bool(next_disabled_reason)
+                if st.button(
+                    f"{label} →",
+                    key=f"nav_next_{prev_step}_{next_step}",
+                    type="secondary",
+                    use_container_width=True,
+                    disabled=disabled,
+                ):
+                    set_current_step(next_step)
+                    st.rerun()
+                if disabled:
+                    st.caption(next_disabled_reason)
+            else:
+                st.caption("Это финальный шаг сценария.")

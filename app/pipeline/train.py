@@ -81,13 +81,13 @@ def run_pipeline(
             status_callback(stage="finalizing_artifacts", progress=90)
 
         return {
+            **best_result,
             "template": template,
             "mode": "grid_search",
             "quality_report_path": str(out / "inputs" / "quality_report.json"),
             "n_experiments": grid_res["n_experiments"],
             "selection_metric": grid_res["selection_metric"],
             "all_results_csv": grid_res["all_results_csv"],
-            **best_result,
         }
 
     res = run_single_experiment(df, template, mapping, params_local, out / "single_run")

@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from ui.api_client import ApiClient
+from ui.components.layout import render_page_header, section_card
 from ui.components.status_cards import metric_card_row
 from ui.poll_rerun import schedule_autorefresh
 from ui.components.nav import page_nav
@@ -56,10 +57,11 @@ def page():
     if st.session_state.pop("_job_just_started", False):
         st.success("Обучение запущено. Ниже можно смотреть прогресс.")
 
-    st.title("Обучение модели")
-    st.caption(
-        "Пользователь задаёт бизнес-смысл прогноза: горизонт и глубину подбора. "
-        "Технические ML-настройки спрятаны в расширенный блок."
+    render_page_header(
+        "Обучение модели",
+        "Задайте бизнес-смысл прогноза: горизонт и глубину подбора. "
+        "Технические ML-настройки спрятаны в расширенный блок.",
+        eyebrow="Шаг 3",
     )
 
     api = ApiClient.from_env()
@@ -242,28 +244,31 @@ def page():
             * len(params["calibration_grid"])
         )
 
-    st.markdown("### Что система сделает")
-    st.write(f"**Модели:** {', '.join(selected_models_display)}")
-    st.write(f"**Метрика отбора:** {METRIC_LABELS.get(metric_key, metric_key)}")
-    st.write(f"**Оценка сложности запуска:** {_estimated_runtime_hint(experiments)}")
-    st.caption(f"Планируется обучить примерно {experiments} вариант(ов).")
+    with section_card(
+        "Что система сделает",
+        "Перед запуском можно быстро проверить, какой набор вариантов будет обучаться.",
+    ):
+        st.write(f"**Модели:** {', '.join(selected_models_display)}")
+        st.write(f"**Метрика отбора:** {METRIC_LABELS.get(metric_key, metric_key)}")
+        st.write(f"**Оценка сложности запуска:** {_estimated_runtime_hint(experiments)}")
+        st.caption(f"Планируется обучить примерно {experiments} вариант(ов).")
 
-    if st.button("Запустить обучение", type="primary", use_container_width=True):
-        try:
-            resp = api.create_job(
-                file_bytes=state.working_file_bytes,
-                template=state.template,
-                mapping=state.mapping,
-                params=params,
-            )
-            state.job_id = resp["job_id"]
-            state.job_status = None
-            state.job_result = None
-            st.session_state["_job_just_started"] = True
-            st.rerun()
-        except Exception as e:
-            st.error(f"Не удалось запустить обучение: {e}")
-            return
+        if st.button("Запустить обучение", type="primary", use_container_width=True):
+            try:
+                resp = api.create_job(
+                    file_bytes=state.working_file_bytes,
+                    template=state.template,
+                    mapping=state.mapping,
+                    params=params,
+                )
+                state.job_id = resp["job_id"]
+                state.job_status = None
+                state.job_result = None
+                st.session_state["_job_just_started"] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"Не удалось запустить обучение: {e}")
+                return
 
     if not state.job_id:
         st.info("После запуска здесь появится прогресс.")
@@ -281,15 +286,15 @@ def page():
     if status.get("status") not in ("done", "failed"):
         schedule_autorefresh(2500, key="training_job_poll")
 
-    st.markdown("### Прогресс")
-    progress = int(status.get("progress") or 0)
-    raw_stage = status.get("stage", "ожидание")
-    stage = _stage_label(str(raw_stage))
-    st.progress(min(max(progress, 0), 100), text=f"{progress}% — {stage}")
+    with section_card("Прогресс", "Страница обновляется автоматически, пока задание находится в работе."):
+        progress = int(status.get("progress") or 0)
+        raw_stage = status.get("stage", "ожидание")
+        stage = _stage_label(str(raw_stage))
+        st.progress(min(max(progress, 0), 100), text=f"{progress}% — {stage}")
 
-    extra = status.get("extra")
-    if extra and isinstance(extra, dict) and extra.get("experiment"):
-        st.caption(f"Сейчас: вариант «{extra.get('experiment')}»")
+        extra = status.get("extra")
+        if extra and isinstance(extra, dict) and extra.get("experiment"):
+            st.caption(f"Сейчас: вариант «{extra.get('experiment')}»")
 
     if status.get("status") == "done":
         st.success("Обучение завершено. Перейдите к шагу «Качество и сравнение».")
@@ -304,26 +309,35 @@ def page():
         saved_params = result.get("params_used") or {}
         display_name = saved_params.get("model_name") or model_name.strip()
 
-        st.markdown("### Итог")
-        st.write(f"**Название:** {display_name}")
-        st.write(f"**Тип данных:** {result.get('template', state.template)}")
-        algo = saved_params.get("model_kind")
-        if algo:
-            st.write(f"**Алгоритм:** {format_model_kind(str(algo))}")
-        hz = saved_params.get("horizon_days")
-        if hz is not None:
-            st.write(f"**Горизонт (дней):** {hz}")
+        with section_card("Итог", "После успешного завершения здесь появляется краткая сводка по лучшей модели."):
+            st.write(f"**Название:** {display_name}")
+            st.write(f"**Тип данных:** {result.get('template', state.template)}")
+            algo = saved_params.get("model_kind")
+            if algo:
+                st.write(f"**Алгоритм:** {format_model_kind(str(algo))}")
+            hz = saved_params.get("horizon_days")
+            if hz is not None:
+                st.write(f"**Горизонт (дней):** {hz}")
 
-        if result.get("mode") == "grid_search":
-            nexp = result.get("n_experiments")
-            if nexp is not None:
-                st.write(f"**Сравнено вариантов:** {nexp}")
-            sm = result.get("selection_metric")
-            if sm:
-                st.write(f"**Метрика выбора лучшего:** {METRIC_LABELS.get(str(sm), sm)}")
-
-        with st.expander("Скачать архив с отчётами (ссылка для браузера)"):
-            st.markdown(f"[Открыть загрузку отчёта]({api.base_url}/jobs/{state.job_id}/download)")
+            if result.get("mode") == "grid_search":
+                nexp = result.get("n_experiments")
+                if nexp is not None:
+                    st.write(f"**Сравнено вариантов:** {nexp}")
+                sm = result.get("selection_metric")
+                if sm:
+                    st.write(f"**Метрика выбора лучшего:** {METRIC_LABELS.get(str(sm), sm)}")
+            try:
+                report_bytes = api.download_job_report(state.job_id)
+                st.download_button(
+                    "Скачать архив с отчётами",
+                    data=report_bytes,
+                    file_name=f"report_{state.job_id[:8]}.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"Не удалось подготовить архив отчётов: {e}")
 
     elif status.get("status") == "failed":
         st.error(f"Обучение остановилось с ошибкой: {status.get('error')}")

@@ -56,6 +56,54 @@ def _dir_tree_max_mtime(root: Path) -> float:
     return mt
 
 
+def _resolve_job_artifact_path(job_id: str, artifact_key: str) -> Path:
+    status = store.read_status(job_id)
+    if status.get("status") != "done":
+        raise HTTPException(status_code=404, detail="Обучение ещё не завершено")
+
+    result = status.get("result") or {}
+    artifacts = result.get("artifacts") or {}
+    if artifact_key == "walk_forward_folds":
+        artifact_path = (result.get("walk_forward") or {}).get("folds_csv")
+    else:
+        artifact_path = artifacts.get(artifact_key)
+
+    if not artifact_path:
+        raise HTTPException(status_code=404, detail=f"Артефакт `{artifact_key}` не найден")
+
+    path = Path(str(artifact_path)).expanduser()
+    try:
+        resolved = path.resolve()
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Некорректный путь артефакта: {e}") from e
+
+    job_artifacts = (store.job_dir(job_id) / "artifacts").resolve()
+    try:
+        resolved.relative_to(job_artifacts)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail="Артефакт должен находиться внутри каталога artifacts конкретного задания",
+        ) from e
+
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail=f"Файл артефакта `{artifact_key}` не найден")
+    return resolved
+
+
+def _resolve_score_artifact_path(score_id: str, artifact_name: str) -> Path:
+    score_dir = score_store.job_dir(score_id)
+    artifacts = (score_dir / "artifacts").resolve()
+    path = (artifacts / artifact_name).resolve()
+    try:
+        path.relative_to(artifacts)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Артефакт скоринга должен находиться внутри каталога artifacts") from e
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Файл артефакта скоринга не найден")
+    return path
+
+
 def _validate_score_mapping(score_mapping: dict) -> None:
     values = [str(v) for v in score_mapping.values() if v]
     dup = sorted({v for v in values if values.count(v) > 1})
@@ -237,6 +285,12 @@ def download(job_id: str):
     return FileResponse(zip_path, filename="report.zip")
 
 
+@app.get("/jobs/{job_id}/artifacts/{artifact_key}")
+def job_artifact(job_id: str, artifact_key: str):
+    artifact = _resolve_job_artifact_path(job_id, artifact_key)
+    return FileResponse(artifact, filename=artifact.name)
+
+
 @app.get("/models")
 def list_models():
     return {"models": store.list_model_bundles()}
@@ -248,12 +302,14 @@ async def score_with_model(
     file: UploadFile = File(...),
     bundle_dir: str = Form(...),
     score_mapping_json: str = Form("{}"),
+    scenario_params_json: str = Form("{}"),
 ):
     bundle_path = _resolve_allowed_bundle_dir(bundle_dir)
     bundle_str = str(bundle_path)
     try:
         bundle = load_model_bundle(bundle_str)
         score_mapping = json.loads(score_mapping_json or "{}")
+        scenario_params = json.loads(scenario_params_json or "{}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Некорректный JSON сопоставления: {e}") from e
     _validate_score_mapping(score_mapping)
@@ -283,7 +339,7 @@ async def score_with_model(
         mapping=bundle.get("mapping") or {},
         score_mapping=score_mapping,
         require_full_mapping=True,
-        reject_extra_columns=True,
+        reject_extra_columns=False,
     )
     if not schema_payload.get("ok"):
         raise HTTPException(status_code=400, detail=_schema_error_detail(schema_payload))
@@ -301,14 +357,57 @@ async def score_with_model(
                 bundle_dir=bundle_str,
                 out_dir=str(score_dir / "artifacts"),
                 score_mapping=score_mapping,
+                scenario_params=scenario_params,
             )
             scored_df = pd.read_csv(res["output_csv"])
+            if "EV_base" in scored_df.columns:
+                scored_df["EV_base"] = pd.to_numeric(scored_df["EV_base"], errors="coerce")
+                scored_df = scored_df.sort_values(["EV_base", "p_calibrated"], ascending=[False, False], na_position="last")
             preview = scored_df.head(50).fillna("").to_dict(orient="records")
+            priority_df = pd.read_csv(res["priority_csv"]) if res.get("priority_csv") else scored_df
+            top_clients_preview = priority_df.head(20).fillna("").to_dict(orient="records")
+            scenario_summary_preview = []
+            if res.get("scenario_summary_csv"):
+                scenario_summary_preview = pd.read_csv(res["scenario_summary_csv"]).fillna("").to_dict(orient="records")
+            scenario_priority_previews = {}
+            scenario_priority_download_urls = {}
+            for scenario_name in ("conservative", "base", "optimistic"):
+                artifact_name = f"retention_priority_list_{scenario_name}.csv"
+                scenario_priority_download_urls[scenario_name] = f"/scores/{score_id}/artifacts/{artifact_name}"
+                artifact_path = (res.get("scenario_priority_csvs") or {}).get(scenario_name)
+                if artifact_path:
+                    scenario_priority_previews[scenario_name] = (
+                        pd.read_csv(artifact_path).head(20).fillna("").to_dict(orient="records")
+                    )
+            risk_segment_counts = {}
+            if "risk_segment" in scored_df.columns:
+                risk_segment_counts = (
+                    scored_df["risk_segment"].fillna("unknown").astype(str).value_counts(dropna=False).to_dict()
+                )
+            ev_series = pd.to_numeric(scored_df["EV_base"], errors="coerce") if "EV_base" in scored_df.columns else pd.Series(dtype=float)
+            positive_ev = ev_series[ev_series > 0]
+            business_summary = {
+                **(res.get("business_summary") or {}),
+                "risk_segment_counts": risk_segment_counts,
+                "clients_with_positive_ev": int((ev_series > 0).sum()) if not ev_series.empty else 0,
+                "total_positive_ev": float(positive_ev.sum()) if not positive_ev.empty else 0.0,
+                "max_ev": float(ev_series.max()) if not ev_series.empty else None,
+                "mean_ev_top20": (
+                    float(ev_series.head(min(20, len(ev_series))).mean()) if not ev_series.empty else None
+                ),
+            }
             payload = {
                 **res,
                 "preview": preview,
+                "top_clients_preview": top_clients_preview,
+                "scenario_summary_preview": scenario_summary_preview,
+                "scenario_priority_previews": scenario_priority_previews,
+                "business_summary": business_summary,
                 "score_id": score_id,
                 "download_url": f"/scores/{score_id}/download",
+                "priority_download_url": f"/scores/{score_id}/artifacts/retention_priority_list.csv",
+                "scenario_priority_download_urls": scenario_priority_download_urls,
+                "scenario_summary_download_url": f"/scores/{score_id}/artifacts/scenario_summary.csv",
             }
             score_store.write_status(
                 score_id,
@@ -355,7 +454,7 @@ async def score_schema_check(
         mapping=bundle.get("mapping") or {},
         score_mapping=score_mapping,
         require_full_mapping=True,
-        reject_extra_columns=True,
+        reject_extra_columns=False,
     )
     payload["input_columns"] = list(df.columns)
     return payload
@@ -378,3 +477,9 @@ def download_score(score_id: str):
     if not out_csv.exists():
         raise HTTPException(status_code=404, detail="No scored file")
     return FileResponse(out_csv, filename="scored_clients.csv")
+
+
+@app.get("/scores/{score_id}/artifacts/{artifact_name}")
+def download_score_artifact(score_id: str, artifact_name: str):
+    artifact = _resolve_score_artifact_path(score_id, artifact_name)
+    return FileResponse(artifact, filename=artifact.name)

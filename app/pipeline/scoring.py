@@ -9,7 +9,7 @@ import pandas as pd
 from app.pipeline.bundle import compare_input_to_schema, load_model_bundle
 from app.pipeline.features import prepare_feature_matrix
 from churnlib.data_module import SnapshotConfig, build_latest_snapshot, canonicalize_types
-from churnlib.economy_module import DEFAULT_SCENARIOS
+from churnlib.economy_module import build_scenarios, expected_value, profit_curve_from_ev, scenario_from_params, best_k
 from churnlib.validation_module import basic_validate
 
 
@@ -39,11 +39,99 @@ def _attach_rule_based_reasons(scored: pd.DataFrame) -> pd.DataFrame:
     return scored
 
 
+def _value_proxy_meta(template: str) -> Dict[str, Any]:
+    if template == "transactions":
+        return {"label": "Денежная ценность клиента", "unit": "money", "is_monetary": True}
+    if template == "subscriptions":
+        return {"label": "MRR / платеж клиента", "unit": "money", "is_monetary": True}
+    return {"label": "Условная ценность активности", "unit": "relative", "is_monetary": False}
+
+
+def _scenario_summary_rows(scored: pd.DataFrame, scenarios: List[Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for sc in scenarios:
+        ev_col = f"EV_{sc.name}"
+        ev_series = pd.to_numeric(scored.get(ev_col), errors="coerce").fillna(0.0)
+        sorted_ev = ev_series.sort_values(ascending=False, kind="mergesort")
+        positive_ev = ev_series[ev_series > 0]
+        curve = profit_curve_from_ev(ev_series.to_numpy(dtype=float))
+        best_k_value, max_profit = best_k(curve) if curve.size else (0, 0.0)
+        rows.append(
+            {
+                "scenario": sc.name,
+                "margin": float(sc.margin),
+                "cost": float(sc.cost),
+                "success": float(sc.success),
+                "clients_with_positive_ev": int((ev_series > 0).sum()),
+                "best_k": int(best_k_value),
+                "max_profit": float(max_profit),
+                "total_positive_ev": float(positive_ev.sum()) if not positive_ev.empty else 0.0,
+                "mean_ev_top20": float(sorted_ev.head(min(20, len(sorted_ev))).mean()) if not sorted_ev.empty else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _scenario_curve_rows(scored: pd.DataFrame, scenarios: List[Any]) -> List[Dict[str, float]]:
+    curves: Dict[str, np.ndarray] = {}
+    max_len = 0
+    for sc in scenarios:
+        curve = profit_curve_from_ev(pd.to_numeric(scored.get(f"EV_{sc.name}"), errors="coerce").fillna(0.0).to_numpy(dtype=float))
+        curves[sc.name] = curve
+        max_len = max(max_len, int(curve.size))
+    rows: List[Dict[str, float]] = []
+    for idx in range(max_len):
+        row: Dict[str, float] = {"top_k": int(idx + 1)}
+        for name, curve in curves.items():
+            row[name] = float(curve[idx]) if idx < curve.size else float(curve[-1]) if curve.size else 0.0
+        rows.append(row)
+    return rows
+
+
+def _priority_labels_by_ev(ev_series: pd.Series, best_k_value: int) -> pd.Series:
+    if ev_series.empty:
+        return pd.Series(dtype=str)
+    labels = pd.Series("Низкий", index=ev_series.index, dtype="object")
+    positive_mask = pd.to_numeric(ev_series, errors="coerce").fillna(0.0) > 0
+    labels.loc[positive_mask] = "Средний"
+    if best_k_value > 0:
+        high_index = ev_series.index[: min(best_k_value, len(ev_series))]
+        labels.loc[high_index] = labels.loc[high_index].where(~positive_mask.loc[high_index], "Высокий")
+    return labels
+
+
+def _priority_sort_key(labels: pd.Series) -> pd.Series:
+    order = {"Высокий": 0, "Средний": 1, "Низкий": 2}
+    return labels.map(order).fillna(3)
+
+
+def _scenario_priority_frame(scored: pd.DataFrame, scenario_name: str, best_k_value: int) -> pd.DataFrame:
+    ev_col = f"EV_{scenario_name}"
+    scenario_df = scored.copy()
+    scenario_df = scenario_df.sort_values([ev_col, "p_calibrated"], ascending=[False, False], na_position="last").reset_index(
+        drop=True
+    )
+    scenario_df["priority"] = _priority_labels_by_ev(pd.to_numeric(scenario_df.get(ev_col), errors="coerce"), best_k_value)
+    scenario_df["recommended_action"] = np.where(
+        scenario_df["priority"].eq("Высокий"),
+        "Включить в кампанию удержания",
+        np.where(scenario_df["priority"].eq("Средний"), "Рассмотреть при наличии ресурса", "Не приоритизировать"),
+    )
+    scenario_df["priority_scenario"] = str(scenario_name)
+    scenario_df["scenario_ev"] = pd.to_numeric(scenario_df.get(ev_col), errors="coerce")
+    scenario_df["_priority_order"] = _priority_sort_key(scenario_df["priority"])
+    scenario_df = scenario_df.sort_values(
+        ["_priority_order", ev_col, "p_calibrated"], ascending=[True, False, False], na_position="last"
+    ).drop(columns=["_priority_order"]).reset_index(drop=True)
+    return scenario_df
+
+
 def run_scoring_pipeline(
     input_csv: str,
     bundle_dir: str,
     out_dir: str,
     score_mapping: Dict[str, Any] | None = None,
+    scenario_params: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -52,6 +140,7 @@ def run_scoring_pipeline(
     mapping = bundle["mapping"]
     template = bundle["config"]["template"]
     params = bundle["config"]["params"]
+    scoring_params = {**params, **(scenario_params or {})}
     feature_cols = bundle["feature_cols"]
     training_schema = bundle.get("training_schema") or {}
     score_mapping = {str(k): str(v) for k, v in (score_mapping or {}).items() if k and v}
@@ -66,7 +155,7 @@ def run_scoring_pipeline(
         mapping=mapping,
         score_mapping=score_mapping,
         require_full_mapping=True,
-        reject_extra_columns=True,
+        reject_extra_columns=False,
     )
     if not schema_check.get("ok"):
         details = []
@@ -131,20 +220,81 @@ def run_scoring_pipeline(
     except Exception:
         scored["risk_segment"] = "unknown"
 
-    base = next(s for s in DEFAULT_SCENARIOS if s.name == "base")
     V = scored["value_proxy"].astype(float).values
-    scored["EV"] = V * scored["p_calibrated"].values * float(base.gain_if_save)
-
+    scenarios = build_scenarios(scoring_params)
+    for sc in scenarios:
+        scored[f"EV_{sc.name}"] = expected_value(scored["p_calibrated"].values, V, sc)
+    scored["EV"] = scored["EV_base"]
+    scored = scored.sort_values(["EV_base", "p_calibrated"], ascending=[False, False], na_position="last").reset_index(drop=True)
+    summary_df = _scenario_summary_rows(scored, scenarios)
     scored = _attach_rule_based_reasons(scored)
+    scenario_best_k = {
+        str(row["scenario"]): int(row["best_k"])
+        for row in summary_df.to_dict(orient="records")
+        if row.get("scenario") is not None
+    }
+    base_row = summary_df.loc[summary_df["scenario"] == "base"].head(1)
+    best_k_base = int(base_row.iloc[0]["best_k"]) if not base_row.empty else 0
+    scored["priority"] = _priority_labels_by_ev(pd.to_numeric(scored.get("EV_base"), errors="coerce"), best_k_base)
+    scored["recommended_action"] = np.where(
+        scored["priority"].eq("Высокий"),
+        "Включить в кампанию удержания",
+        np.where(scored["priority"].eq("Средний"), "Рассмотреть при наличии ресурса", "Не приоритизировать"),
+    )
+
+    ev_series = pd.to_numeric(scored["EV_base"], errors="coerce")
+    positive_ev = ev_series[ev_series > 0]
+    scenario_rows = summary_df.to_dict(orient="records")
+    value_meta = _value_proxy_meta(template)
+    business_summary = {
+        "scenario": "base",
+        "scenario_params": (
+            {
+                "margin": float(base_row.iloc[0]["margin"]),
+                "cost": float(base_row.iloc[0]["cost"]),
+                "success": float(base_row.iloc[0]["success"]),
+            }
+            if not base_row.empty
+            else {}
+        ),
+        "clients_with_positive_ev": int((ev_series > 0).sum()) if not ev_series.empty else 0,
+        "total_positive_ev": float(positive_ev.sum()) if not positive_ev.empty else 0.0,
+        "max_ev": float(ev_series.max()) if not ev_series.empty else None,
+        "mean_ev_top20": float(ev_series.head(min(20, len(ev_series))).mean()) if not ev_series.empty else None,
+        "best_k": best_k_base,
+        "scenario_rows": scenario_rows,
+        "scenario_curve_rows": _scenario_curve_rows(scored, scenarios),
+        "value_proxy_label": value_meta["label"],
+        "value_unit": value_meta["unit"],
+        "is_monetary": bool(value_meta["is_monetary"]),
+    }
+    scenario_priority_frames = {
+        sc.name: _scenario_priority_frame(scored, sc.name, scenario_best_k.get(sc.name, 0)) for sc in scenarios
+    }
+    priority_df = scenario_priority_frames.get("base", scored.copy())
 
     out_csv = out / "scored_clients.csv"
+    priority_csv = out / "retention_priority_list.csv"
+    summary_csv = out / "scenario_summary.csv"
     scored.to_csv(out_csv, index=False)
+    priority_df.to_csv(priority_csv, index=False)
+    summary_df.to_csv(summary_csv, index=False)
+    scenario_priority_csvs: Dict[str, str] = {}
+    for scenario_name, scenario_df in scenario_priority_frames.items():
+        scenario_path = out / f"retention_priority_list_{scenario_name}.csv"
+        scenario_df.to_csv(scenario_path, index=False)
+        scenario_priority_csvs[scenario_name] = str(scenario_path)
 
     return {
         "template": template,
         "bundle_dir": bundle_dir,
         "output_csv": str(out_csv),
+        "priority_csv": str(priority_csv),
+        "scenario_priority_csvs": scenario_priority_csvs,
+        "scenario_summary_csv": str(summary_csv),
         "n_scored": int(len(scored)),
         "schema_check": schema_check,
         "score_mapping": score_mapping,
+        "scenario_params_used": dict(scenario_params or {}),
+        "business_summary": business_summary,
     }
