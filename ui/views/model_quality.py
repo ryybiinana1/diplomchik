@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from ui.api_client import ApiClient
-from ui.components.charts import plot_experiment_scores, render_bar_chart, render_line_chart
+from ui.components.charts import render_bar_chart, render_line_chart
 from ui.components.layout import render_page_header, section_card
 from ui.poll_rerun import schedule_autorefresh
 from ui.components.nav import page_nav
@@ -80,24 +80,16 @@ def _read_job_csv(api: ApiClient, job_id: str, artifact_key: str) -> pd.DataFram
     return pd.read_csv(BytesIO(data))
 
 
-def _pick_priority_label_col(df: pd.DataFrame) -> str:
-    for candidate in ("entity_id", "customer_id", "client_id", "account_id", "user_id"):
-        if candidate in df.columns:
-            return candidate
-    non_numeric = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
-    return non_numeric[0] if non_numeric else ""
-
-
 def _priority_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    for col in ("p", "p_cal", "p_raw", "EV_base", "value_proxy", "target"):
+    for col in ("p", "p_cal", "p_raw", "EV_base", "value_proxy"):
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     display_cols = [
         c
-        for c in ("entity_id", "customer_id", "client_id", "account_id", "user_id", "p", "EV_base", "value_proxy", "target")
+        for c in ("entity_id", "customer_id", "client_id", "account_id", "user_id", "p", "EV_base", "value_proxy")
         if c in out.columns
     ]
     if not display_cols:
@@ -112,7 +104,6 @@ def _priority_table(df: pd.DataFrame) -> pd.DataFrame:
             "p": "Вероятность оттока",
             "EV_base": "Ожидаемый эффект",
             "value_proxy": "Ценность",
-            "target": "Факт target",
         }
     )
 
@@ -322,17 +313,13 @@ def page():
             elif comparison_table.empty:
                 st.info("Таблица сравнения пуста.")
             else:
-                only_success = st.checkbox("Показывать только успешные варианты", value=True)
                 filtered = (
                     comparison_table[comparison_table["Статус"] == "Успех"].copy()
-                    if only_success and "Статус" in comparison_table.columns
+                    if "Статус" in comparison_table.columns
                     else comparison_table
                 )
                 with st.expander("Открыть подробную таблицу сравнения", expanded=False):
                     st.dataframe(filtered, width="stretch", hide_index=True)
-                if "Оценка отбора" in filtered.columns:
-                    chart_df = filtered.rename(columns={"Вариант": "label", "Оценка отбора": "score"})
-                    plot_experiment_scores(chart_df, "label", "score", "Лидерборд по метрике отбора")
 
     roc = quality.get("roc_curve", {})
     pr = quality.get("pr_curve", {})
@@ -429,36 +416,19 @@ def page():
             st.dataframe(cm_df, width="stretch")
 
     with tab_stability:
-        if artifacts.get("feature_psi_csv"):
-            try:
-                psi_df = _read_job_csv(api, state.job_id, "feature_psi_csv")
-                if not psi_df.empty:
-                    st.markdown("#### Стабильность признаков (PSI, топ)")
-                    if {"feature", "psi"}.issubset(set(psi_df.columns)):
-                        top_psi = psi_df.sort_values("psi", ascending=False).head(20)
-                        render_bar_chart(
-                            top_psi,
-                            x_col="feature",
-                            y_col="psi",
-                            title="Топ признаков по PSI",
-                            x_title="Признак",
-                            y_title="PSI",
-                            horizontal=True,
-                            height=420,
-                        )
-                    else:
-                        st.dataframe(psi_df.head(20), width="stretch", hide_index=True)
-            except Exception as e:
-                st.info(f"Не удалось прочитать feature_psi.csv: {e}")
-
         if walk_forward.get("folds_csv"):
             try:
                 folds_df = _read_job_csv(api, state.job_id, "walk_forward_folds")
                 if not folds_df.empty:
                     st.markdown("#### Walk-forward по фолдам")
+                    st.caption(
+                        "Walk-forward показывает, насколько качество модели устойчиво на последовательных временных разрезах."
+                    )
                     st.dataframe(folds_df, width="stretch", hide_index=True)
             except Exception as e:
                 st.info(f"Не удалось прочитать файл walk-forward: {e}")
+        else:
+            st.info("Дополнительная проверка устойчивости для этого запуска недоступна.")
 
     with tab_econ:
         c1, c2 = st.columns(2)
@@ -467,10 +437,14 @@ def page():
         c2.metric("Макс. ожидаемая прибыль", "—" if bm_profit is None else f"{float(bm_profit):,.2f}".replace(",", " "))
         if business_scenario:
             st.caption(
-                "Сценарий удержания: "
+                "Базовый сценарий удержания: "
                 f"margin={float(business_scenario.get('margin', 0)):.2f}, "
                 f"cost={float(business_scenario.get('cost', 0)):.2f}, "
                 f"success={float(business_scenario.get('success', 0)):.2f}"
+            )
+            st.caption(
+                "Это центральный сценарий для расчёта экономики. На графике и в сводке дополнительно сравниваются "
+                "осторожный и оптимистичный сценарии, которые строятся от этих же базовых допущений."
             )
 
         if artifacts.get("profit_plot"):
@@ -487,6 +461,10 @@ def page():
                 ps_df = _read_job_csv(api, state.job_id, "profit_summary")
                 if not ps_df.empty:
                     st.markdown("#### Сводка по сценариям")
+                    st.caption(
+                        "`best_k` — сколько клиентов выгоднее всего взять в кампанию; "
+                        "`max_profit` — максимальный ожидаемый эффект при таком размере кампании."
+                    )
                     st.dataframe(ps_df, width="stretch", hide_index=True)
             except Exception as e:
                 st.info(f"Не удалось прочитать profit_summary.csv: {e}")
@@ -496,26 +474,8 @@ def page():
                 prio_df = _read_job_csv(api, state.job_id, "priority_csv")
                 if not prio_df.empty:
                     st.markdown("#### Топ клиентов, которых стоит удерживать")
-                    label_col = _pick_priority_label_col(prio_df)
-                    if label_col and "EV_base" in prio_df.columns:
-                        top_chart = prio_df.head(15).copy()
-                        top_chart["_label"] = top_chart[label_col].astype(str)
-                        render_bar_chart(
-                            top_chart,
-                            x_col="_label",
-                            y_col="EV_base",
-                            title="Лидеры по ожидаемому эффекту удержания",
-                            x_title="Клиент",
-                            y_title="Ожидаемый эффект",
-                            horizontal=True,
-                            height=420,
-                        )
                     st.dataframe(_priority_table(prio_df.head(25)), width="stretch", hide_index=True)
             except Exception as e:
                 st.info(f"Не удалось прочитать priority_list_topk.csv: {e}")
-
-    st.success(
-        "Эта модель сохранена как итоговая и доступна на шаге «Прогноз» для оценки новых клиентов."
-    )
 
     page_nav(STEP_3_TRAIN, STEP_5_FORECAST)

@@ -179,10 +179,13 @@ class ApiClient:
             }
         return r.json()
 
-    def download_score_csv(self, score_id: str) -> bytes:
+    def download_score_zip(self, score_id: str) -> bytes:
         r = self.session.get(f"{self.base_url}/scores/{score_id}/download", timeout=600)
         r.raise_for_status()
         return r.content
+
+    def download_score_csv(self, score_id: str) -> bytes:
+        return self.download_score_zip(score_id)
 
     def download_score_artifact(self, score_id: str, artifact_name: str) -> bytes:
         r = self.session.get(f"{self.base_url}/scores/{score_id}/artifacts/{artifact_name}", timeout=600)

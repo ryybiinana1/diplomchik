@@ -10,7 +10,7 @@ from app.pipeline.bundle import compare_input_to_schema, load_model_bundle
 from app.pipeline.features import prepare_feature_matrix
 from churnlib.data_module import SnapshotConfig, build_latest_snapshot, canonicalize_types
 from churnlib.economy_module import build_scenarios, expected_value, profit_curve_from_ev, scenario_from_params, best_k
-from churnlib.report_module import write_scoring_html_report
+from churnlib.report_module import write_scoring_docx_report, write_scoring_html_report
 from churnlib.validation_module import basic_validate
 
 
@@ -287,6 +287,7 @@ def run_scoring_pipeline(
         scenario_priority_csvs[scenario_name] = str(scenario_path)
 
     score_report_info = {}
+    score_docx_info = {}
     try:
         score_report_info = write_scoring_html_report(
             out_path=str(out / "score_report.html"),
@@ -312,6 +313,28 @@ def run_scoring_pipeline(
         )
     except Exception:
         score_report_info = {}
+    try:
+        score_docx_info = write_scoring_docx_report(
+            out_path=str(out / "score_report.docx"),
+            model_info={
+                "model_name": params.get("model_name"),
+                "template": template,
+                "model_kind": params.get("model_kind"),
+                "horizon_days": params.get("horizon_days"),
+            },
+            n_scored=int(len(scored)),
+            business_summary=business_summary,
+            scenario_rows=scenario_rows,
+            top_clients_preview=priority_df.head(25).fillna("").to_dict(orient="records"),
+            score_mapping=score_mapping,
+            csv_paths={
+                "scored_clients.csv": str(out_csv),
+                "scenario_summary.csv": str(summary_csv),
+                **{Path(path).name: path for path in scenario_priority_csvs.values()},
+            },
+        )
+    except Exception:
+        score_docx_info = {}
 
     return {
         "template": template,
@@ -321,6 +344,7 @@ def run_scoring_pipeline(
         "scenario_priority_csvs": scenario_priority_csvs,
         "scenario_summary_csv": str(summary_csv),
         "score_report_html": score_report_info.get("html_path"),
+        "score_report_docx": score_docx_info.get("docx_path"),
         "n_scored": int(len(scored)),
         "schema_check": schema_check,
         "score_mapping": score_mapping,

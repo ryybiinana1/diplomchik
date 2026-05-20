@@ -552,6 +552,26 @@ def _save_model_metric_chart(df: pd.DataFrame, metric: str, out_path: Path, *, h
     plt.close(fig)
     return str(out_path)
 
+
+def _save_scenario_max_effect_chart(df: pd.DataFrame, out_path: Path) -> Optional[str]:
+    if df.empty or not {"scenario", "max_profit"}.issubset(df.columns):
+        return None
+    chart_df = df[["scenario", "max_profit"]].copy()
+    chart_df["max_profit"] = pd.to_numeric(chart_df["max_profit"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["max_profit"])
+    if chart_df.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(7.2, 3.6))
+    ax.bar(chart_df["scenario"].astype(str), chart_df["max_profit"], color="#2563eb")
+    ax.set_title("Максимальный эффект по сценариям")
+    ax.set_ylabel("max_profit")
+    ax.set_xlabel("Сценарий")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return str(out_path)
+
 def _img_data_uri(path: Optional[str]) -> str:
     if not path:
         return ""
@@ -896,3 +916,291 @@ def write_scoring_html_report(
     out_p.parent.mkdir(parents=True, exist_ok=True)
     out_p.write_text(html, encoding="utf-8")
     return {"html_path": str(out_p)}
+
+
+def _describe_csv_column(column: str) -> str:
+    descriptions = {
+        "entity_id": "Идентификатор клиента, аккаунта или объекта, для которого рассчитан прогноз. Используется как ключ строки результата.",
+        "customer_id": "Идентификатор клиента из исходного CSV, если он был сохранён в результате.",
+        "client_id": "Идентификатор клиента из исходного CSV, если в данных использовалось такое название.",
+        "account_id": "Идентификатор аккаунта из исходного CSV для подписочной модели.",
+        "user_id": "Идентификатор пользователя из исходного CSV для событийной модели.",
+        "subject_id": "Идентификатор субъекта/пользователя из событийных данных.",
+        "anchor_time": "Дата точки отсчёта, на которую собрана история клиента и рассчитан прогноз.",
+        "target": "Фактический обучающий target, если он сохранён в диагностической выгрузке: 1 — отток/нет будущей активности, 0 — активность сохранилась.",
+        "p_raw": "Вероятность оттока, которую выдала модель до калибровки вероятностей.",
+        "p_cal": "Откалиброванная вероятность оттока на тестовой/диагностической выборке.",
+        "p_calibrated": "Итоговая вероятность оттока после калибровки. Чем выше значение, тем выше риск.",
+        "p": "Вероятность оттока, использованная при расчёте ожидаемого эффекта удержания.",
+        "pred": "Бинарное решение по рабочему порогу: 1 — модель относит объект к риску оттока, 0 — не относит.",
+        "risk_segment": "Группа риска, присвоенная по p_calibrated: low, medium, high или critical.",
+        "value_proxy": "Оценка ценности клиента для экономического расчёта. Для транзакций обычно основана на сумме покупок, для подписок — на MRR, для событий — на активности.",
+        "EV": "Ожидаемый эффект удержания в базовом сценарии. Дублирует EV_base для удобства сортировки.",
+        "EV_base": "Ожидаемый эффект удержания в базовом сценарии: вероятность оттока × ценность × success × margin − cost.",
+        "EV_conservative": "Ожидаемый эффект в осторожном сценарии с более жёсткими допущениями по стоимости и успеху удержания.",
+        "EV_optimistic": "Ожидаемый эффект в оптимистичном сценарии с более благоприятными бизнес-допущениями.",
+        "priority": "Приоритет для кампании удержания: высокий, средний или низкий в зависимости от EV и позиции в рейтинге.",
+        "recommended_action": "Текстовая рекомендация: включить в кампанию, рассмотреть при наличии ресурса или не приоритизировать.",
+        "priority_scenario": "Экономический сценарий, для которого сформирован данный приоритетный список.",
+        "scenario_ev": "Ожидаемый эффект, по которому отсортирован сценарный список клиентов.",
+        "reason_1": "Главная автоматически сформированная причина риска, например давняя активность или редкие покупки.",
+        "reason_2": "Вторая причина риска, если для клиента найдено несколько объяснений.",
+        "reason_3": "Третья причина риска, если она доступна.",
+        "scenario": "Название сценария экономики удержания: conservative, base или optimistic.",
+        "margin": "Доля ценности клиента, которую бизнес условно сохраняет при успешном удержании.",
+        "cost": "Стоимость одного удерживающего контакта или действия на клиента.",
+        "success": "Ожидаемая вероятность успешного удержания клиента после контакта.",
+        "clients_with_positive_ev": "Сколько клиентов в сценарии имеют положительный ожидаемый эффект удержания.",
+        "best_k": "Оптимальное количество клиентов для кампании в этом сценарии: top-k с максимальным суммарным EV.",
+        "max_profit": "Максимальный суммарный ожидаемый эффект, достигаемый при best_k.",
+        "total_positive_ev": "Сумма всех положительных EV в сценарии без ограничения на best_k.",
+        "mean_ev_top20": "Средний ожидаемый эффект среди первых 20 клиентов рейтинга.",
+        "frequency_tx": "Количество покупок/транзакций клиента в историческом окне перед прогнозом.",
+        "monetary": "Суммарная сумма покупок клиента в историческом окне.",
+        "amount_mean": "Средняя сумма одной покупки клиента в историческом окне.",
+        "amount_std": "Стандартное отклонение суммы покупок клиента; показывает разброс чеков.",
+        "recency_days": "Сколько дней прошло от последней активности/покупки до точки прогноза.",
+        "customer_lifetime_days": "Сколько дней клиент наблюдается в данных до точки прогноза: от первой активности до anchor_time.",
+        "interpurchase_mean_days": "Средний интервал в днях между покупками клиента.",
+        "interpurchase_std_days": "Разброс интервалов между покупками; показывает регулярность или нерегулярность активности.",
+        "qty_sum": "Суммарное количество купленных единиц товара в историческом окне.",
+        "qty_mean": "Среднее количество единиц товара в одной покупке.",
+        "unit_price_mean": "Средняя цена единицы товара в покупках клиента.",
+        "unit_price_std": "Разброс цены единицы товара в покупках клиента.",
+        "item_nunique": "Количество уникальных товаров, купленных клиентом.",
+        "country_nunique": "Количество уникальных стран/географий, встречавшихся в истории клиента.",
+        "mrr_sum": "Суммарный MRR аккаунта в историческом окне для подписочных данных.",
+        "mrr_last": "Последний известный MRR аккаунта перед точкой прогноза.",
+        "event_count": "Количество событий пользователя в историческом окне для событийных данных.",
+    }
+    if column in descriptions:
+        return descriptions[column]
+    if column.startswith("extra__"):
+        parts = column.split("__")
+        source = parts[1] if len(parts) > 1 else "дополнительной колонки"
+        suffix = parts[2] if len(parts) > 2 else ""
+        suffix_descriptions = {
+            "mean": "среднее значение",
+            "std": "разброс значений",
+            "min": "минимальное значение",
+            "max": "максимальное значение",
+            "sum": "сумма значений",
+            "last": "последнее известное значение",
+            "nunique": "количество уникальных значений",
+            "entropy": "разнообразие категорий: чем выше, тем менее однотипны значения",
+            "top1_share": "доля самого частого значения",
+            "missing_share": "доля пропусков",
+            "code_mean": "средний числовой код категории",
+            "code_max": "максимальный числовой код категории",
+            "code_last": "последний числовой код категории",
+            "age_mean_days": "средний возраст даты в днях относительно точки прогноза",
+            "age_std_days": "разброс возраста даты в днях",
+            "age_min_days": "минимальный возраст даты в днях",
+            "age_max_days": "максимальный возраст даты в днях",
+        }
+        if suffix.startswith("share_"):
+            value = suffix.replace("share_", "", 1)
+            return f"Доля строк клиента, где дополнительная колонка `{source}` имела значение `{value}`."
+        if suffix.startswith("last_is_"):
+            value = suffix.replace("last_is_", "", 1)
+            return f"Флаг того, что последнее значение дополнительной колонки `{source}` равно `{value}`."
+        detail = suffix_descriptions.get(suffix, f"агрегат `{suffix}`")
+        return f"Агрегат по дополнительной колонке `{source}`: {detail} в истории клиента до прогноза."
+    if column.startswith("EV_"):
+        scenario = column.replace("EV_", "", 1)
+        return f"Ожидаемый эффект удержания для сценария `{scenario}`."
+    if column.endswith("_raw"):
+        base = column.removesuffix("_raw")
+        return f"Исходное значение `{base}` до финального преобразования или калибровки."
+    if column.endswith("_cal"):
+        base = column.removesuffix("_cal")
+        return f"Откалиброванное значение `{base}` после постобработки модели."
+    return (
+        f"Колонка `{column}` сохранена из подготовленного набора признаков модели. "
+        "Она содержит числовую характеристику поведения клиента, рассчитанную на историческом окне перед прогнозом."
+    )
+
+
+def _csv_column_dictionary(columns: List[str]) -> List[Dict[str, str]]:
+    return [{"Колонка": col, "Описание": _describe_csv_column(col)} for col in columns]
+
+
+def write_scoring_docx_report(
+    out_path: str,
+    model_info: Dict[str, Any],
+    n_scored: int,
+    business_summary: Dict[str, Any],
+    scenario_rows: List[Dict[str, Any]],
+    top_clients_preview: List[Dict[str, Any]],
+    score_mapping: Dict[str, str],
+    csv_paths: Dict[str, str],
+) -> Dict[str, Any]:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt, RGBColor
+
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Inches(0.6)
+    section.bottom_margin = Inches(0.6)
+    section.left_margin = Inches(0.7)
+    section.right_margin = Inches(0.7)
+    doc.styles["Normal"].font.name = "Arial"
+    doc.styles["Normal"].font.size = Pt(9.5)
+
+    def shade_cell(cell, fill: str = "DDEBFF") -> None:
+        tc_pr = cell._tc.get_or_add_tcPr()
+        shading = OxmlElement("w:shd")
+        shading.set(qn("w:fill"), fill)
+        tc_pr.append(shading)
+
+    def set_cell_margins(cell) -> None:
+        tc_pr = cell._tc.get_or_add_tcPr()
+        tc_mar = tc_pr.first_child_found_in("w:tcMar")
+        if tc_mar is None:
+            tc_mar = OxmlElement("w:tcMar")
+            tc_pr.append(tc_mar)
+        for name, value in {"top": 90, "start": 110, "bottom": 90, "end": 110}.items():
+            node = tc_mar.find(qn(f"w:{name}"))
+            if node is None:
+                node = OxmlElement(f"w:{name}")
+                tc_mar.append(node)
+            node.set(qn("w:w"), str(value))
+            node.set(qn("w:type"), "dxa")
+
+    def add_heading(text: str, level: int = 1) -> None:
+        paragraph = doc.add_heading(text, level=level)
+        for run in paragraph.runs:
+            run.font.color.rgb = RGBColor(30, 64, 175)
+
+    def add_table(rows: List[Dict[str, Any]], cols: List[str]) -> None:
+        if not rows:
+            doc.add_paragraph("Данные недоступны.")
+            return
+        table = doc.add_table(rows=1, cols=len(cols))
+        table.style = "Table Grid"
+        for i, col in enumerate(cols):
+            cell = table.rows[0].cells[i]
+            cell.text = col
+            shade_cell(cell)
+            set_cell_margins(cell)
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    run.bold = True
+                    run.font.color.rgb = RGBColor(30, 64, 175)
+        for row in rows:
+            cells = table.add_row().cells
+            for i, col in enumerate(cols):
+                cells[i].text = str(row.get(col, "—"))
+                set_cell_margins(cells[i])
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run("ОТЧЁТ ПО РЕЗУЛЬТАТАМ ПРОГНОЗА")
+    run.bold = True
+    run.font.size = Pt(18)
+    run.font.color.rgb = RGBColor(15, 23, 42)
+    subtitle = doc.add_paragraph("Churn / Retention Studio · прогноз риска и экономического эффекта")
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    add_heading("1. Краткий итог", level=1)
+    add_table(
+        [
+            {"Показатель": "Модель", "Значение": model_info.get("model_name", "—")},
+            {"Показатель": "Алгоритм", "Значение": model_info.get("model_kind", "—")},
+            {"Показатель": "Горизонт прогноза", "Значение": model_info.get("horizon_days", "—")},
+            {"Показатель": "Оценено строк", "Значение": n_scored},
+            {"Показатель": "Клиентов с EV > 0", "Значение": business_summary.get("clients_with_positive_ev", "—")},
+            {"Показатель": "Рекомендуемый top-k", "Значение": business_summary.get("best_k", "—")},
+            {"Показатель": "Суммарный положительный EV", "Значение": _fmt_num(business_summary.get("total_positive_ev"), 2)},
+        ],
+        ["Показатель", "Значение"],
+    )
+
+    add_heading("2. Сценарии экономического эффекта", level=1)
+    doc.add_paragraph(
+        "Сценарии показывают, насколько решение устойчиво к разным бизнес-допущениям: стоимости контакта, "
+        "вероятности успешного удержания и доле ценности клиента, которую можно сохранить."
+    )
+    doc.add_paragraph(
+        "Осторожный сценарий использует более строгие допущения: ниже вероятность успеха и выше стоимость контакта. "
+        "Базовый сценарий — центральная оценка. Оптимистичный сценарий показывает результат при более благоприятных "
+        "допущениях. Параметр margin отвечает за сохраняемую долю ценности клиента, cost — за стоимость удержания, "
+        "success — за вероятность успешного удержания."
+    )
+    scenario_df = pd.DataFrame(scenario_rows or [])
+    scenario_cols = [
+        c
+        for c in ["scenario", "margin", "cost", "success", "clients_with_positive_ev", "best_k", "max_profit", "total_positive_ev"]
+        if c in scenario_df.columns
+    ]
+    add_table(scenario_df.fillna("").to_dict(orient="records"), scenario_cols)
+    scenario_chart = _save_scenario_max_effect_chart(scenario_df, Path(out_path).parent / "_docx_charts" / "scenario_max_profit.png")
+    _add_picture_if_exists(doc, scenario_chart, width_inch=6.5)
+
+    add_heading("3. Топ клиентов базового сценария", level=1)
+    doc.add_paragraph("Первые строки приоритетного списка показывают клиентов, с которых разумно начинать кампанию удержания.")
+    top_df = pd.DataFrame(top_clients_preview or [])
+    top_cols = [
+        c
+        for c in ["entity_id", "risk_segment", "priority", "recommended_action", "p_calibrated", "value_proxy", "EV_base", "reason_1"]
+        if c in top_df.columns
+    ]
+    add_table(top_df.fillna("").head(5).to_dict(orient="records"), top_cols)
+
+    add_heading("4. Сопоставление колонок", level=1)
+    doc.add_paragraph("Ниже указано, какие колонки нового CSV были сопоставлены с колонками обучающего набора.")
+    add_table(
+        [{"Колонка в обучении": k, "Колонка в прогнозном CSV": v} for k, v in score_mapping.items()],
+        ["Колонка в обучении", "Колонка в прогнозном CSV"],
+    )
+
+    add_heading("5. Файлы в архиве", level=1)
+    file_rows = [
+        {
+            "Файл": "scored_clients.csv",
+            "Что внутри": "Полный результат скоринга по всем объектам: вероятности, сегменты риска, EV и пояснения.",
+        },
+        {
+            "Файл": "scenario_summary.csv",
+            "Что внутри": "Сводка по экономическим сценариям: best_k, max_profit и число клиентов с положительным EV.",
+        },
+        {
+            "Файл": "retention_priority_list_conservative.csv",
+            "Что внутри": "Приоритетный список для осторожного сценария.",
+        },
+        {
+            "Файл": "retention_priority_list_base.csv",
+            "Что внутри": "Приоритетный список для базового сценария.",
+        },
+        {
+            "Файл": "retention_priority_list_optimistic.csv",
+            "Что внутри": "Приоритетный список для оптимистичного сценария.",
+        },
+    ]
+    add_table(file_rows, ["Файл", "Что внутри"])
+
+    add_heading("6. Словарь колонок CSV", level=1)
+    for filename, path in csv_paths.items():
+        try:
+            cols = list(pd.read_csv(path, nrows=0).columns)
+        except Exception:
+            cols = []
+        if not cols:
+            continue
+        add_heading(filename, level=2)
+        add_table(_csv_column_dictionary(cols), ["Колонка", "Описание"])
+
+    add_heading("7. Как читать результат", level=1)
+    doc.add_paragraph(
+        "Чем выше p_calibrated, тем выше риск оттока. Чем выше EV_base или scenario_ev, тем выгоднее включить клиента "
+        "в удерживающую кампанию. Дополнительные колонки, которые не были сопоставлены с обучающим набором, "
+        "не участвуют в расчёте прогноза."
+    )
+
+    out_p = Path(out_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(out_p)
+    return {"docx_path": str(out_p)}

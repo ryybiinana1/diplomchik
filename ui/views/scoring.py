@@ -8,7 +8,6 @@ import pandas as pd
 import streamlit as st
 
 from ui.api_client import ApiClient
-from ui.components.charts import render_bar_chart
 from ui.components.dataset_helpers import profile_extra_column
 from ui.components.layout import render_field_intro, render_page_header, section_card
 from ui.components.nav import page_nav
@@ -530,43 +529,10 @@ def page():
         "Сопоставление колонок",
         "Подтвердите соответствие для каждой колонки, использованной при обучении модели.",
     ):
-        auto_left, auto_right = st.columns([1, 2])
-        with auto_left:
-            if st.button("Заполнить предложенные соответствия", use_container_width=True):
-                state.score_column_mapping = suggested_mapping
-                _reset_score_outputs(state, clear_mapping=False)
-                st.rerun()
-        with auto_right:
-            if inspect_payload:
-                st.caption(
-                    "Подсказки собраны по серверному `inspect` и по похожим названиям колонок. "
-                    "Их всё равно нужно подтвердить перед запуском."
-                )
-            else:
-                st.caption(
-                    "Серверные подсказки недоступны, поэтому используется только совпадение по похожим названиям."
-                )
-
         if inspect_error:
             st.warning(f"Не удалось получить серверные подсказки для автосопоставления: {inspect_error}")
 
         if expected_cols:
-            etalon_rows = []
-            required_cols = set(training_schema.get("required_source_columns") or [])
-            for source_col in expected_cols:
-                role = reverse_mapping.get(source_col)
-                role_title = (role_meta.get(role, {}) or {}).get("title") if role else ""
-                etalon_rows.append(
-                    {
-                        "Эталонная колонка (обучение)": source_col,
-                        "Роль": role_title or role or "Доп. признак",
-                        "Обязательная": "Да" if source_col in required_cols else "Нет",
-                        "Автоподбор": suggested_mapping.get(source_col, "—"),
-                    }
-                )
-            st.markdown("#### Эталонные колонки выбранной модели")
-            st.dataframe(pd.DataFrame(etalon_rows), width="stretch", hide_index=True)
-
             with st.form("score_mapping_form"):
                 next_mapping: dict[str, str] = {}
                 st.markdown('<p class="ui-form-block-title">Колонки, использованные при обучении</p>', unsafe_allow_html=True)
@@ -603,8 +569,8 @@ def page():
         s3.metric("Неиспользованных колонок", str(len(unused_actual_cols)))
 
         if unused_actual_cols:
-            st.warning(
-                "В новом файле есть колонки, которые не входят в обучающий набор: "
+            st.info(
+                "В новом файле есть дополнительные колонки. Модель не строит прогноз по ним: они не участвуют в расчёте и не передаются в признаки прогноза: "
                 + ", ".join(unused_actual_cols[:12])
             )
             if len(unused_actual_cols) > 12:
@@ -632,65 +598,31 @@ def page():
             return
 
     schema = state.score_schema_check or {}
-    with section_card("Проверка структуры файла", "Прогноз запускается только при полном совпадении схемы."):
-        status = schema.get("status")
-        if status == "ok":
-            st.success("Структура файла полностью совпадает с тем, что использовалось при обучении модели.")
-        elif status == "warning":
-            st.warning("Файл частично подходит, но структура ещё не совпадает полностью.")
-        else:
-            st.error("Файл не подходит для этой модели: нужно полное сопоставление без лишних колонок.")
+    if not schema.get("ok"):
+        missing = schema.get("missing_mapping") or schema.get("missing_required") or schema.get("missing_expected") or []
+        details = ", ".join(missing[:8]) if missing else "проверьте сопоставление обязательных колонок"
+        st.warning(f"Для запуска прогноза нужно сопоставить обязательные колонки: {details}")
 
-        summary_rows = []
-        if schema.get("missing_mapping"):
-            summary_rows.append(
-                {
-                    "Проверка": "Не сопоставлены ожидаемые колонки",
-                    "Детали": ", ".join(schema["missing_mapping"]),
-                }
+    if st.button("Запустить прогноз", type="primary", use_container_width=True, disabled=not schema.get("ok")):
+        try:
+            resp = api.start_score(
+                state.score_file_bytes,
+                bundle_dir=chosen["bundle_dir"],
+                score_mapping=state.score_column_mapping,
+                scenario_params={
+                    "business_margin": float(business_margin),
+                    "business_cost": float(business_cost),
+                    "business_success": float(business_success),
+                },
             )
-        if schema.get("missing_required"):
-            summary_rows.append({"Проверка": "Не хватает обязательных колонок", "Детали": ", ".join(schema["missing_required"])})
-        if schema.get("missing_expected"):
-            summary_rows.append({"Проверка": "Не хватает колонок из обучающего набора", "Детали": ", ".join(schema["missing_expected"])})
-        if schema.get("extra_columns"):
-            summary_rows.append({"Проверка": "Есть лишние колонки", "Детали": ", ".join(schema["extra_columns"][:10])})
-        if schema.get("invalid_mapping_keys"):
-            summary_rows.append(
-                {
-                    "Проверка": "Есть недопустимые ключи сопоставления",
-                    "Детали": ", ".join(schema["invalid_mapping_keys"]),
-                }
-            )
-        if schema.get("dtype_mismatch"):
-            details = ", ".join(
-                f"{row['column']} ({row['actual_dtype']} вместо {row['expected_dtype']})"
-                for row in schema["dtype_mismatch"][:6]
-            )
-            summary_rows.append({"Проверка": "Есть отличия по типам", "Детали": details})
-        if not summary_rows:
-            summary_rows.append({"Проверка": "Проверка схемы", "Детали": "Критичных отличий не найдено"})
-        st.dataframe(summary_rows, width="stretch", hide_index=True)
-
-        if st.button("Запустить прогноз", type="primary", use_container_width=True, disabled=not schema.get("ok")):
-            try:
-                resp = api.start_score(
-                    state.score_file_bytes,
-                    bundle_dir=chosen["bundle_dir"],
-                    score_mapping=state.score_column_mapping,
-                    scenario_params={
-                        "business_margin": float(business_margin),
-                        "business_cost": float(business_cost),
-                        "business_success": float(business_success),
-                    },
-                )
-                state.score_id = resp["score_id"]
-                state.score_status = None
-                state.score_result = None
-                st.success("Прогноз поставлен в очередь.")
-            except Exception as e:
-                st.error(f"Не удалось запустить: {e}")
-                return
+            state.score_id = resp["score_id"]
+            state.score_status = None
+            state.score_result = None
+            st.success("Прогноз поставлен в очередь.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Не удалось запустить: {e}")
+            return
 
     if not state.score_id:
         page_nav(STEP_4_QUALITY, None)
@@ -717,234 +649,22 @@ def page():
             state.score_result = sc["result"]
             st.success("Прогноз готов.")
 
-            n = state.score_result.get("n_scored")
-            business_summary = state.score_result.get("business_summary") or {}
-            top_clients = state.score_result.get("top_clients_preview") or []
-            scenario_priority_previews = state.score_result.get("scenario_priority_previews") or {}
-            scenario_rows = state.score_result.get("scenario_summary_preview") or business_summary.get("scenario_rows") or []
-            scenario_df = _scenario_summary_table(scenario_rows)
-            top_table = _top_clients_table(top_clients)
-            scenario_client_tables = {
-                name: _top_clients_table(rows)
-                for name, rows in scenario_priority_previews.items()
-                if rows
-            }
-            scenario_artifacts = {
-                "conservative": "retention_priority_list_conservative.csv",
-                "base": "retention_priority_list_base.csv",
-                "optimistic": "retention_priority_list_optimistic.csv",
-            }
-
             with section_card(
                 "Готовые материалы",
-                "Скачайте результат в том формате, который нужен конкретной роли: аналитик, руководитель или операционная команда.",
+                "Скачайте единый архив: внутри DOCX-отчёт и CSV-файлы с результатами.",
             ):
-                st.metric("Строк в результате", str(n) if n is not None else "—")
                 try:
-                    csv_bytes = api.download_score_csv(state.score_id)
+                    zip_bytes = api.download_score_zip(state.score_id)
                     st.download_button(
-                        label="Скачать полный CSV со скорингом",
-                        data=csv_bytes,
-                        file_name="scored_clients.csv",
-                        mime="text/csv",
+                        label="Скачать результаты прогноза ZIP",
+                        data=zip_bytes,
+                        file_name=f"scoring_results_{state.score_id[:8]}.zip",
+                        mime="application/zip",
                         type="primary",
                         use_container_width=True,
                     )
                 except Exception as e:
-                    st.warning(f"Не удалось подготовить файл для кнопки: {e}")
-
-                dl1, dl2 = st.columns(2)
-                try:
-                    priority_bytes = api.download_score_artifact(state.score_id, "retention_priority_list_base.csv")
-                    dl1.download_button(
-                        label="Скачать базовый список клиентов",
-                        data=priority_bytes,
-                        file_name="retention_priority_list_base.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    dl1.warning(f"Не удалось подготовить base list: {e}")
-                try:
-                    summary_bytes = api.download_score_artifact(state.score_id, "scenario_summary.csv")
-                    dl2.download_button(
-                        label="Скачать сводку сценариев",
-                        data=summary_bytes,
-                        file_name="scenario_summary.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    dl2.warning(f"Не удалось подготовить scenario summary: {e}")
-
-                try:
-                    score_report_bytes = api.download_score_artifact(state.score_id, "score_report.html")
-                    st.download_button(
-                        label="Скачать единый отчёт по прогнозу (HTML)",
-                        data=score_report_bytes,
-                        file_name="score_report.html",
-                        mime="text/html",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    st.warning(f"Не удалось подготовить единый отчёт по прогнозу: {e}")
-
-                st.markdown("#### Списки клиентов по сценариям")
-                scenario_cols = st.columns(3)
-                for idx, scenario_name in enumerate(("conservative", "base", "optimistic")):
-                    with scenario_cols[idx]:
-                        try:
-                            scenario_bytes = api.download_score_artifact(state.score_id, scenario_artifacts[scenario_name])
-                            st.download_button(
-                                label=f"Скачать {_scenario_label(scenario_name)} список",
-                                data=scenario_bytes,
-                                file_name=scenario_artifacts[scenario_name],
-                                mime="text/csv",
-                                use_container_width=True,
-                                key=f"download_{scenario_name}_{state.score_id}",
-                            )
-                        except Exception as e:
-                            st.warning(f"Не удалось подготовить {_scenario_label(scenario_name).lower()} список: {e}")
-
-            result_tabs = st.tabs(["Рекомендация", "Сценарии", "Клиенты", "Полный результат"])
-
-            with result_tabs[0]:
-                with section_card(
-                    "Что делать сейчас",
-                    "Это основной управленческий вывод по базовому сценарию удержания.",
-                ):
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Клиентов с EV > 0", str(business_summary.get("clients_with_positive_ev", "—")))
-                    m2.metric("Суммарный положительный EV", _safe_money(business_summary.get("total_positive_ev")))
-                    m3.metric("Макс. EV", _safe_money(business_summary.get("max_ev")))
-                    m4.metric("Рекомендуемый top-k", str(business_summary.get("best_k", "—")))
-                    st.write(f"**Вывод:** {_summary_message(business_summary)}")
-
-                    sc_params = business_summary.get("scenario_params") or {}
-                    if sc_params:
-                        st.caption(
-                            "Базовый сценарий: "
-                            f"margin={float(sc_params.get('margin', 0)):.2f}, "
-                            f"cost={float(sc_params.get('cost', 0)):.2f}, "
-                            f"success={float(sc_params.get('success', 0)):.2f}"
-                        )
-                    if not business_summary.get("is_monetary", True):
-                        st.info(
-                            "Для текущего типа данных ценность клиента рассчитана в условных единицах активности, "
-                            "поэтому EV тоже не интерпретируется как деньги."
-                        )
-
-                if not scenario_df.empty:
-                    with section_card(
-                        "Таблица сценариев",
-                        "Сначала посмотрите, насколько устойчиво решение к изменению бизнес-допущений.",
-                    ):
-                        st.dataframe(scenario_df, width="stretch", hide_index=True)
-
-                if not top_table.empty:
-                    with section_card(
-                        "Кого брать в кампанию удержания",
-                        "Ниже показан базовый сценарий. На вкладке «Клиенты» доступны отдельные списки по всем трём сценариям.",
-                    ):
-                        st.dataframe(top_table.head(12), width="stretch", hide_index=True)
-
-                risk_counts = business_summary.get("risk_segment_counts") or {}
-                if risk_counts:
-                    risk_df = pd.DataFrame(
-                        [{"Сегмент": str(k), "Количество": int(v)} for k, v in risk_counts.items()]
-                    )
-                    render_bar_chart(
-                        risk_df,
-                        x_col="Сегмент",
-                        y_col="Количество",
-                        title="Распределение клиентов по сегментам риска",
-                        x_title="Сегмент риска",
-                        y_title="Количество клиентов",
-                    )
-
-            with result_tabs[1]:
-                if not scenario_df.empty:
-                    with section_card(
-                        "Сценарии экономического эффекта",
-                        "Этот блок показывает, насколько устойчиво решение к изменению бизнес-допущений.",
-                    ):
-                        st.dataframe(scenario_df, width="stretch", hide_index=True)
-                        if {"Сценарий", "Макс. эффект"}.issubset(set(scenario_df.columns)):
-                            chart_df = scenario_df.rename(columns={"Сценарий": "scenario", "Макс. эффект": "max_profit"})
-                            render_bar_chart(
-                                chart_df,
-                                x_col="scenario",
-                                y_col="max_profit",
-                                title="Максимальный эффект по сценариям",
-                                x_title="Сценарий",
-                                y_title="Макс. эффект",
-                            )
-                else:
-                    st.info("Сводка сценариев пока недоступна.")
-
-                curve_rows = business_summary.get("scenario_curve_rows") or []
-                if curve_rows:
-                    curve_df = pd.DataFrame(curve_rows)
-                    if "top_k" in curve_df.columns:
-                        with section_card(
-                            "Кумулятивный эффект по top-k",
-                            "График показывает, сколько эффекта даёт расширение удерживающей кампании.",
-                        ):
-                            st.line_chart(curve_df.set_index("top_k"), width="stretch")
-
-            with result_tabs[2]:
-                if scenario_client_tables:
-                    with section_card(
-                        "Клиенты для удержания",
-                        "Для каждого сценария список ранжируется отдельно, поэтому состав и порядок клиентов могут отличаться.",
-                    ):
-                        scenario_tabs = st.tabs(
-                            [_scenario_label(name) for name in ("conservative", "base", "optimistic")]
-                        )
-                        for idx, scenario_name in enumerate(("conservative", "base", "optimistic")):
-                            with scenario_tabs[idx]:
-                                scenario_rows = scenario_priority_previews.get(scenario_name) or []
-                                scenario_top_df = pd.DataFrame(scenario_rows)
-                                scenario_top_table = scenario_client_tables.get(scenario_name, pd.DataFrame())
-                                if not scenario_top_table.empty:
-                                    label_col = _pick_client_label_col(scenario_top_df)
-                                    ev_col = "scenario_ev" if "scenario_ev" in scenario_top_df.columns else _scenario_ev_col(scenario_name)
-                                    if label_col and ev_col in scenario_top_df.columns:
-                                        top_chart = scenario_top_df.head(15).copy()
-                                        top_chart["_label"] = top_chart[label_col].astype(str)
-                                        top_chart[ev_col] = pd.to_numeric(top_chart[ev_col], errors="coerce")
-                                        render_bar_chart(
-                                            top_chart,
-                                            x_col="_label",
-                                            y_col=ev_col,
-                                            title=f"Лидеры по эффекту: {_scenario_label(scenario_name)} сценарий",
-                                            x_title="Клиент",
-                                            y_title="Ожидаемый эффект",
-                                            horizontal=True,
-                                            height=420,
-                                        )
-                                    st.dataframe(scenario_top_table, width="stretch", hide_index=True)
-                                else:
-                                    st.info(f"Список для сценария «{_scenario_label(scenario_name)}» пока недоступен.")
-                else:
-                    st.info("Сценарные списки клиентов пока недоступны.")
-
-            with result_tabs[3]:
-                preview = state.score_result.get("preview", [])
-                if preview:
-                    with section_card(
-                        "Полный результат скоринга",
-                        "Этот блок полезен для аналитической проверки и просмотра всех колонок результата.",
-                    ):
-                        st.dataframe(preview, width="stretch", height=400)
-                else:
-                    st.info("Предпросмотр результата пока недоступен.")
-
-                st.info(
-                    "**Как читать результат:** чем выше откалиброванная вероятность, тем выше риск; "
-                    "чем выше EV_base, тем выгоднее включить клиента в удерживающую кампанию. "
-                    "Сегмент риска даёт быстрое обобщение, а поясняющие колонки помогают интерпретации."
-                )
+                    st.warning(f"Не удалось подготовить ZIP: {e}")
 
         elif sc.get("status") == "failed":
             st.error(f"Прогноз не выполнен: {sc.get('error')}")

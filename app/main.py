@@ -489,10 +489,24 @@ def score_status(score_id: str):
 @app.get("/scores/{score_id}/download")
 def download_score(score_id: str):
     score_dir = score_store.job_dir(score_id)
-    out_csv = score_dir / "artifacts" / "scored_clients.csv"
-    if not out_csv.exists():
-        raise HTTPException(status_code=404, detail="No scored file")
-    return FileResponse(out_csv, filename="scored_clients.csv")
+    artifacts = score_dir / "artifacts"
+    if not artifacts.exists():
+        raise HTTPException(status_code=404, detail="No score artifacts")
+    zip_path = score_dir / "scoring_results.zip"
+    include_ext = {".csv", ".docx"}
+    artifacts_mtime = 0.0
+    for path in artifacts.rglob("*"):
+        if path.is_file() and path.suffix.lower() in include_ext and path.name != "retention_priority_list.csv":
+            artifacts_mtime = max(artifacts_mtime, path.stat().st_mtime)
+    if not zip_path.exists() or zip_path.stat().st_mtime < artifacts_mtime:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path in artifacts.rglob("*"):
+                if not path.is_file() or path.suffix.lower() not in include_ext:
+                    continue
+                if path.name == "retention_priority_list.csv":
+                    continue
+                zf.write(path, arcname=str(path.relative_to(artifacts)))
+    return FileResponse(zip_path, filename="scoring_results.zip")
 
 
 @app.get("/scores/{score_id}/artifacts/{artifact_name}")

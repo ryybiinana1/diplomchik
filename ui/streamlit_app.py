@@ -51,8 +51,7 @@ if legacy in _LEGACY_STEPS:
 elif legacy not in STEPS_ORDER:
     st.session_state["current_step"] = STEP_1_DATA
 
-if st.session_state.pop("_scroll_top_after_rerun", False):
-    scroll_to_top()
+_should_scroll_top = st.session_state.pop("_scroll_top_after_rerun", False)
 
 st.sidebar.markdown("## Churn / Retention Studio")
 st.sidebar.caption("Разделы")
@@ -78,6 +77,10 @@ if _nav_choice != _cur:
     st.rerun()
 
 selected = st.session_state["current_step"]
+if st.session_state.get("_last_rendered_step") != selected:
+    _should_scroll_top = True
+    st.session_state["_last_rendered_step"] = selected
+
 render_progress_header(selected, get_state())
 
 if selected == STEPS_ORDER[0]:
@@ -90,3 +93,6 @@ elif selected == STEPS_ORDER[3]:
     model_quality_page()
 else:
     scoring_page()
+
+if _should_scroll_top:
+    scroll_to_top()
