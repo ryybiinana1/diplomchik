@@ -18,7 +18,7 @@ from churnlib.drift_module import compute_feature_psi
 from churnlib.economy_module import build_scenarios, scenario_from_params
 from churnlib.explain_module import ExplainConfig, shap_explain_global, save_shap_artifacts
 from churnlib.model_module import TrainConfig, train_time_cv, walk_forward_backtest
-from churnlib.report_module import ReportConfig, write_docx_report, write_reports
+from churnlib.report_module import ReportConfig, write_docx_report, write_reports, write_training_html_report
 from churnlib.validation_module import assess_suitability
 
 
@@ -124,6 +124,7 @@ def run_single_experiment(
     out_dir: Path,
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    lightweight_candidate = bool(params.get("lightweight_candidate", False))
     extra_cols_final, extra_feature_config, extra_audit = _normalize_extra_feature_config(
         df=df,
         template=template,
@@ -163,29 +164,44 @@ def run_single_experiment(
 
     train_cfg = TrainConfig(
         model_kind=str(params.get("model_kind", "lightgbm")),
+        n_splits=int(params.get("n_splits", 2 if lightweight_candidate else 4)),
         use_class_weight=bool(params.get("use_class_weight", False)),
         model_params=params.get("model_params", {}),
     )
     train_res = train_time_cv(snaps, feature_cols, train_cfg)
-    backtest_res = walk_forward_backtest(snaps, feature_cols, train_cfg)
-    backtest_res["folds_df"].to_csv(out_dir / "tables" / "walk_forward_folds.csv", index=False)
+    backtest_res = {"mean_metrics": {}, "std_metrics": {}, "folds_df": pd.DataFrame()}
+    if not lightweight_candidate:
+        backtest_res = walk_forward_backtest(snaps, feature_cols, train_cfg)
+        backtest_res["folds_df"].to_csv(out_dir / "tables" / "walk_forward_folds.csv", index=False)
 
-    cal_cfg = CalibrationConfig(method=str(params.get("calibration", "sigmoid")), cv=3)
+    cal_cfg = CalibrationConfig(method=str(params.get("calibration", "sigmoid")), cv=int(params.get("calibration_cv", 3)))
 
     X_train = prepare_feature_matrix(train_res["train_df"], feature_cols)
     X_test = prepare_feature_matrix(train_res["test_df"], feature_cols)
     y_train = train_res["train_df"]["target"].astype(int).values
     y_test = train_res["test_df"]["target"].astype(int).values
 
-    cal_res = calibrate(train_res["model"], X_train, y_train, X_test, y_test, cal_cfg)
+    if lightweight_candidate:
+        p_raw = train_res["model"].predict_proba(X_test)[:, 1]
+        cal_res = {
+            "calibrator": train_res["model"],
+            "p_raw": p_raw,
+            "p_cal": p_raw,
+            "raw_metrics": train_res.get("test_metrics", {}),
+            "metrics": train_res.get("test_metrics", {}),
+            "delta": {},
+            "method": "none",
+        }
+    else:
+        cal_res = calibrate(train_res["model"], X_train, y_train, X_test, y_test, cal_cfg)
 
-    save_calibration_plot(
-        y_true=y_test,
-        p_raw=cal_res["p_raw"],
-        p_cal=cal_res["p_cal"],
-        path=str(out_dir / "plots" / "calibration_curve.png"),
-    )
-    save_calibration_summary(cal_res, str(out_dir / "tables" / "calibration_summary.json"))
+        save_calibration_plot(
+            y_true=y_test,
+            p_raw=cal_res["p_raw"],
+            p_cal=cal_res["p_cal"],
+            path=str(out_dir / "plots" / "calibration_curve.png"),
+        )
+        save_calibration_summary(cal_res, str(out_dir / "tables" / "calibration_summary.json"))
 
     quality_payload = build_quality_payload(
         y_true=y_test,
@@ -204,12 +220,13 @@ def run_single_experiment(
     test_scored.to_csv(test_scored_path, index=False)
 
     psi_path = None
-    try:
-        psi_df = compute_feature_psi(train_res["train_df"], train_res["test_df"], feature_cols)
-        psi_path = out_dir / "tables" / "feature_psi.csv"
-        psi_df.to_csv(psi_path, index=False)
-    except Exception:
-        psi_path = None
+    if not lightweight_candidate:
+        try:
+            psi_df = compute_feature_psi(train_res["train_df"], train_res["test_df"], feature_cols)
+            psi_path = out_dir / "tables" / "feature_psi.csv"
+            psi_df.to_csv(psi_path, index=False)
+        except Exception:
+            psi_path = None
 
     rep_cfg = ReportConfig(out_dir=str(out_dir), top_k=int(params.get("top_k_priority", 500)))
     business_scenario = scenario_from_params(params)
@@ -269,93 +286,138 @@ def run_single_experiment(
 
     docx_path = str(out_dir / "report.docx")
     docx_info = {}
-    try:
-        docx_info = write_docx_report(
-            out_path=docx_path,
-            template=template,
-            params_used={
-                **params,
-                "extra_feature_cols": extra_cols_final,
-                "extra_feature_config": extra_feature_config,
-            },
-            suitability=suitability,
-            metrics={
-                "target_rate": target_rate,
-                "class_counts": class_counts,
-                "cv_metrics_mean": train_res.get("cv_metrics_mean", {}),
-                "cv_metrics_std": train_res.get("cv_metrics_std", {}),
-                "test_metrics_raw": cal_res.get("raw_metrics", {}),
-                "test_metrics_cal": test_metrics_cal,
-                "walk_forward_mean": backtest_res.get("mean_metrics", {}),
-                "walk_forward_std": backtest_res.get("std_metrics", {}),
-                "business_metrics": {
-                    "base_best_k": business_rep.get("base_best_k"),
-                    "base_max_profit": business_rep.get("base_max_profit"),
-                    "scenario": {
-                        "margin": business_scenario.margin,
-                        "cost": business_scenario.cost,
-                        "success": business_scenario.success,
+    if not lightweight_candidate:
+        try:
+            docx_info = write_docx_report(
+                out_path=docx_path,
+                template=template,
+                params_used={
+                    **params,
+                    "extra_feature_cols": extra_cols_final,
+                    "extra_feature_config": extra_feature_config,
+                },
+                suitability=suitability,
+                metrics={
+                    "target_rate": target_rate,
+                    "class_counts": class_counts,
+                    "cv_metrics_mean": train_res.get("cv_metrics_mean", {}),
+                    "cv_metrics_std": train_res.get("cv_metrics_std", {}),
+                    "test_metrics_raw": cal_res.get("raw_metrics", {}),
+                    "test_metrics_cal": test_metrics_cal,
+                    "walk_forward_mean": backtest_res.get("mean_metrics", {}),
+                    "walk_forward_std": backtest_res.get("std_metrics", {}),
+                    "business_metrics": {
+                        "base_best_k": business_rep.get("base_best_k"),
+                        "base_max_profit": business_rep.get("base_max_profit"),
+                        "scenario": {
+                            "margin": business_scenario.margin,
+                            "cost": business_scenario.cost,
+                            "success": business_scenario.success,
+                        },
                     },
                 },
-            },
-            artifact_paths={
-                "profit_plot": business_rep.get("profit_plot"),
-                "calibration_plot": str(out_dir / "plots" / "calibration_curve.png"),
-                "shap_beeswarm": shap_artifacts.get("shap_beeswarm"),
-                "shap_bar": shap_artifacts.get("shap_bar"),
-            },
-            extra_feature_audit=extra_audit,
-        )
-    except Exception:
-        docx_info = {}
+                artifact_paths={
+                    "profit_plot": business_rep.get("profit_plot"),
+                    "calibration_plot": str(out_dir / "plots" / "calibration_curve.png"),
+                    "shap_beeswarm": shap_artifacts.get("shap_beeswarm"),
+                    "shap_bar": shap_artifacts.get("shap_bar"),
+                },
+                extra_feature_audit=extra_audit,
+            )
+        except Exception:
+            docx_info = {}
 
-    try:
-        write_model_card(
-            template=template,
-            params_used={
-                **params,
-                "extra_feature_cols": extra_cols_final,
-                "extra_feature_config": extra_feature_config,
-            },
-            suitability=suitability,
-            metrics={
-                "target_rate": target_rate,
-                "class_counts": class_counts,
-                "test_metrics_raw": cal_res.get("raw_metrics", {}),
-                "test_metrics_cal": test_metrics_cal,
-                "cv_metrics_mean": train_res.get("cv_metrics_mean", {}),
-                "cv_metrics_std": train_res.get("cv_metrics_std", {}),
-                "walk_forward": backtest_res.get("mean_metrics", {}),
-                "business_metrics": {
-                    "base_best_k": business_rep.get("base_best_k"),
-                    "base_max_profit": business_rep.get("base_max_profit"),
-                    "scenario": {
-                        "margin": business_scenario.margin,
-                        "cost": business_scenario.cost,
-                        "success": business_scenario.success,
+    html_report_info = {}
+    if not lightweight_candidate:
+        try:
+            html_report_info = write_training_html_report(
+                out_path=str(out_dir / "training_report.html"),
+                template=template,
+                params_used={
+                    **params,
+                    "extra_feature_cols": extra_cols_final,
+                    "extra_feature_config": extra_feature_config,
+                },
+                suitability=suitability,
+                metrics={
+                    "target_rate": target_rate,
+                    "class_counts": class_counts,
+                    "cv_metrics_mean": train_res.get("cv_metrics_mean", {}),
+                    "cv_metrics_std": train_res.get("cv_metrics_std", {}),
+                    "test_metrics_raw": cal_res.get("raw_metrics", {}),
+                    "test_metrics_cal": test_metrics_cal,
+                    "walk_forward_mean": backtest_res.get("mean_metrics", {}),
+                    "walk_forward_std": backtest_res.get("std_metrics", {}),
+                    "business_metrics": {
+                        "base_best_k": business_rep.get("base_best_k"),
+                        "base_max_profit": business_rep.get("base_max_profit"),
+                        "scenario": {
+                            "margin": business_scenario.margin,
+                            "cost": business_scenario.cost,
+                            "success": business_scenario.success,
+                        },
                     },
                 },
-            },
-            extra_feature_audit=extra_audit,
-            out_path=str(out_dir / "model_card.md"),
-        )
-    except Exception:
-        pass
+                artifact_paths={
+                    "profit_plot": business_rep.get("profit_plot"),
+                    "calibration_plot": str(out_dir / "plots" / "calibration_curve.png"),
+                    "shap_beeswarm": shap_artifacts.get("shap_beeswarm"),
+                    "shap_bar": shap_artifacts.get("shap_bar"),
+                },
+                mode="single",
+            )
+        except Exception:
+            html_report_info = {}
 
-    try:
-        write_datasheet(
-            df=snaps,
-            template=template,
-            out_path=str(out_dir / "datasheet.json"),
-            extra={
-                "mapping_used": mapping_used,
-                "extra_feature_cols": extra_cols_final,
-                "feature_cols": feature_cols,
-                "target_rate": target_rate,
-            },
-        )
-    except Exception:
-        pass
+    if not lightweight_candidate:
+        try:
+            write_model_card(
+                template=template,
+                params_used={
+                    **params,
+                    "extra_feature_cols": extra_cols_final,
+                    "extra_feature_config": extra_feature_config,
+                },
+                suitability=suitability,
+                metrics={
+                    "target_rate": target_rate,
+                    "class_counts": class_counts,
+                    "test_metrics_raw": cal_res.get("raw_metrics", {}),
+                    "test_metrics_cal": test_metrics_cal,
+                    "cv_metrics_mean": train_res.get("cv_metrics_mean", {}),
+                    "cv_metrics_std": train_res.get("cv_metrics_std", {}),
+                    "walk_forward": backtest_res.get("mean_metrics", {}),
+                    "business_metrics": {
+                        "base_best_k": business_rep.get("base_best_k"),
+                        "base_max_profit": business_rep.get("base_max_profit"),
+                        "scenario": {
+                            "margin": business_scenario.margin,
+                            "cost": business_scenario.cost,
+                            "success": business_scenario.success,
+                        },
+                    },
+                },
+                extra_feature_audit=extra_audit,
+                out_path=str(out_dir / "model_card.md"),
+            )
+        except Exception:
+            pass
+
+    if not lightweight_candidate:
+        try:
+            write_datasheet(
+                df=snaps,
+                template=template,
+                out_path=str(out_dir / "datasheet.json"),
+                extra={
+                    "mapping_used": mapping_used,
+                    "extra_feature_cols": extra_cols_final,
+                    "feature_cols": feature_cols,
+                    "target_rate": target_rate,
+                },
+            )
+        except Exception:
+            pass
 
     return {
         "template": template,
@@ -403,6 +465,8 @@ def run_single_experiment(
             "profit_summary": business_rep.get("profit_summary"),
             "priority_csv": business_rep.get("priority_csv"),
             "report_docx": docx_info.get("docx_path"),
+            "training_report_docx": docx_info.get("docx_path"),
+            "training_report_html": html_report_info.get("html_path"),
             "calibration_plot": str(out_dir / "plots" / "calibration_curve.png"),
             "test_scored_csv": str(test_scored_path),
             "feature_psi_csv": str(psi_path) if psi_path else None,
@@ -433,6 +497,10 @@ def run_experiment_grid(
     all_rows: List[Dict[str, Any]] = []
     best_result: Optional[Dict[str, Any]] = None
     best_score: float = -1e18
+    best_params_local: Optional[Dict[str, Any]] = None
+    best_exp_dir: Optional[Path] = None
+    best_exp_name: Optional[str] = None
+    want_shap = bool(params.get("enable_shap", False))
 
     total = max(len(horizons) * len(histories) * len(steps) * len(models) * len(calibrations), 1)
     done = 0
@@ -456,6 +524,11 @@ def run_experiment_grid(
                                 "calibration": cal,
                             }
                         )
+                        # Для скорости в grid-search отключаем SHAP на каждом кандидате.
+                        # SHAP посчитаем один раз только для лучшей конфигурации после отбора.
+                        p_local["enable_shap"] = False
+                        p_local["lightweight_candidate"] = True
+                        p_local["n_splits"] = int(params.get("candidate_n_splits", 2))
 
                         if status_callback:
                             status_callback(
@@ -467,6 +540,11 @@ def run_experiment_grid(
                         try:
                             res = run_single_experiment(df, template, mapping_used, p_local, exp_dir)
                             score = choose_metric(res, selection_metric)
+                            cm = (res.get("quality_payload") or {}).get("confusion_matrix") or []
+                            tn = cm[0][0] if len(cm) > 0 and len(cm[0]) > 0 else None
+                            fp = cm[0][1] if len(cm) > 0 and len(cm[0]) > 1 else None
+                            fn = cm[1][0] if len(cm) > 1 and len(cm[1]) > 0 else None
+                            tp = cm[1][1] if len(cm) > 1 and len(cm[1]) > 1 else None
                             all_rows.append(
                                 {
                                     "experiment": exp_name,
@@ -478,14 +556,35 @@ def run_experiment_grid(
                                     "step_days": int(s),
                                     "model_kind": mk,
                                     "calibration": cal,
+                                    "roc_auc": res.get("test_metrics_cal", {}).get("roc_auc"),
+                                    "pr_auc": res.get("test_metrics_cal", {}).get("pr_auc"),
+                                    "brier": res.get("test_metrics_cal", {}).get("brier"),
+                                    "precision": res.get("test_metrics_cal", {}).get("precision"),
+                                    "recall": res.get("test_metrics_cal", {}).get("recall"),
+                                    "f1": res.get("test_metrics_cal", {}).get("f1"),
+                                    "base_best_k": res.get("business_metrics", {}).get("base_best_k"),
+                                    "base_max_profit": res.get("business_metrics", {}).get("base_max_profit"),
+                                    "cm_tn": tn,
+                                    "cm_fp": fp,
+                                    "cm_fn": fn,
+                                    "cm_tp": tp,
                                     "test_metrics_cal": json.dumps(res.get("test_metrics_cal", {}), ensure_ascii=False),
                                     "business_metrics": json.dumps(res.get("business_metrics", {}), ensure_ascii=False),
                                     "bundle_dir": res.get("artifacts", {}).get("bundle", {}).get("bundle_dir"),
+                                    "weights_model": str(
+                                        (Path(res.get("artifacts", {}).get("bundle", {}).get("bundle_dir", "")) / "model.joblib")
+                                    ),
+                                    "weights_calibrator": str(
+                                        (Path(res.get("artifacts", {}).get("bundle", {}).get("bundle_dir", "")) / "calibrator.joblib")
+                                    ),
                                 }
                             )
                             if score > best_score:
                                 best_score = score
                                 best_result = res
+                                best_params_local = dict(p_local)
+                                best_exp_dir = exp_dir
+                                best_exp_name = exp_name
                         except Exception as e:
                             all_rows.append(
                                 {
@@ -507,6 +606,24 @@ def run_experiment_grid(
 
     if best_result is None:
         raise ValueError("All experiments failed. Check experiment_results.csv")
+
+    # Полный прогон делаем только для победителя: отчёт, калибровка, walk-forward и SHAP.
+    if best_params_local is not None and best_exp_dir is not None:
+        try:
+            if status_callback:
+                status_callback(
+                    stage="best_model_interpretation",
+                    progress=93,
+                    extra={"experiment": best_exp_name or "best_experiment"},
+                )
+            p_best = dict(best_params_local)
+            p_best["enable_shap"] = want_shap
+            p_best.pop("lightweight_candidate", None)
+            p_best.pop("n_splits", None)
+            best_result = run_single_experiment(df, template, mapping_used, p_best, best_exp_dir)
+        except Exception:
+            # Если полный прогон упал, оставляем быстрый результат, чтобы не ронять весь job.
+            pass
 
     return {
         "mode": "grid_search",

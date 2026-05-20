@@ -5,7 +5,6 @@ import streamlit as st
 
 from ui.api_client import ApiClient
 from ui.components.layout import render_page_header, section_card
-from ui.components.status_cards import metric_card_row
 from ui.poll_rerun import schedule_autorefresh
 from ui.components.nav import page_nav
 from ui.state import get_state, read_csv_cached
@@ -51,6 +50,11 @@ def _estimated_runtime_hint(experiments: int) -> str:
     if experiments <= 8:
         return "умеренно"
     return "долго"
+
+
+@st.cache_data(show_spinner=False)
+def _download_job_report_cached(base_url: str, job_id: str) -> bytes:
+    return ApiClient(base_url=base_url).download_job_report(job_id)
 
 
 def page():
@@ -102,82 +106,84 @@ def page():
         help="Отображается в шаге «Прогноз» при выборе модели.",
     )
 
-    st.markdown("### Что хотим получить")
-    enable_shap = st.checkbox("Добавить интерпретацию признаков в отчёт", value=False)
+    st.markdown("### Настройка модели")
+    enable_shap = True
 
     st.info(
         {
             "fast": "Один устойчивый baseline без лишних настроек.",
-            "balanced": "Небольшое сравнение сильных моделей без перегрузки параметрами.",
+            "balanced": "Сбалансированный запуск для сравнения моделей.",
             "compare": "Полный режим для лидерборда и выбора лучшего варианта.",
         }[preset]
     )
 
-    if row_count:
-        metric_card_row(
-            [
-                ("Строк в датасете", f"{row_count:,}".replace(",", " ")),
-                ("Выбрано доп. признаков", str(len(state.extra_feature_cols or []))),
-                ("Рекомендованный режим", {"fast": "Быстро", "balanced": "Сбалансировано", "compare": "Тщательное"}[recommended_mode]),
-            ]
-        )
-
-    min_events_in_history = 1
     metric_key = "pr_auc"
     calibration_grid = ["sigmoid"]
-    step_days = 30
 
     if preset == "fast":
-        horizon = st.selectbox("Горизонт прогноза (дней)", [30, 60, 90], index=0)
-        default_history = {30: 180, 60: 180, 90: 365}[int(horizon)]
-        history_days = default_history
-        step_days = 30
-        selected_models_display = [format_model_kind("lightgbm")]
-        st.caption("Система обучит один сильный baseline на фиксированных настройках.")
-        with st.expander("Тонкая настройка", expanded=False):
-            history_days = st.selectbox("Окно истории", [90, 180, 365], index=[90, 180, 365].index(default_history))
-            step_days = st.selectbox("Шаг точки отсчёта", [7, 14, 30], index=2)
-            min_events_in_history = st.selectbox("Минимум событий в истории", [1, 2, 3], index=0)
-        params = {
-            "mode": "quick",
-            "model_name": model_name.strip(),
-            "horizon_days": int(horizon),
-            "history_days": int(history_days),
-            "step_days": int(step_days),
-            "min_events_in_history": int(min_events_in_history),
-            "model_kind": "lightgbm",
-            "calibration": "sigmoid",
-            "enable_shap": bool(enable_shap),
-            "extra_feature_cols": state.extra_feature_cols or [],
-            "extra_feature_config": state.extra_feature_config or {},
-        }
-        experiments = 1
-    elif preset == "balanced":
-        horizon = st.selectbox("Горизонт прогноза (дней)", [30, 60, 90], index=0)
-        default_history = {30: 180, 60: 180, 90: 365}[int(horizon)]
         metric_key = st.selectbox(
             "Метрика выбора лучшей модели",
             options=list(METRIC_LABELS.keys()),
             format_func=lambda k: METRIC_LABELS.get(k, k),
             index=0,
         )
-        selected_models_display = [format_model_kind("lightgbm"), format_model_kind("catboost"), format_model_kind("logreg")]
-        history_grid = sorted({int(default_history), 365 if int(default_history) < 365 else 180})
+        horizons_grid = st.multiselect("Горизонты прогноза (дней)", [30, 60, 90], default=[30]) or [30]
+        default_history = {30: 180, 60: 180, 90: 365}[int(horizons_grid[0])]
+        history_grid = [default_history]
+        steps_grid = [30]
+        selected_models_display = [format_model_kind("lightgbm")]
+        st.caption("Быстрый пресет: одна модель с перебором выбранных горизонтов/окон/шагов.")
         with st.expander("Тонкая настройка", expanded=False):
             history_grid = st.multiselect("Окна истории", [90, 180, 365], default=history_grid) or history_grid
-            step_days = st.selectbox("Шаг точки отсчёта", [14, 30], index=1)
-            min_events_in_history = st.selectbox("Минимум событий в истории", [1, 2, 3], index=0)
+            steps_grid = st.multiselect("Шаги точки отсчёта", [7, 14, 30], default=steps_grid) or steps_grid
+        params = {
+            "mode": "compare",
+            "model_name": model_name.strip(),
+            "horizon_days_grid": [int(x) for x in horizons_grid],
+            "history_days_grid": [int(x) for x in history_grid],
+            "step_days_grid": [int(x) for x in steps_grid],
+            "min_events_in_history": 1,
+            "model_kind_grid": ["lightgbm"],
+            "selection_metric": metric_key,
+            "calibration_grid": ["sigmoid"],
+            "enable_shap": bool(enable_shap),
+            "extra_feature_cols": state.extra_feature_cols or [],
+            "extra_feature_config": state.extra_feature_config or {},
+        }
+        experiments = (
+            len(params["horizon_days_grid"])
+            * len(params["history_days_grid"])
+            * len(params["step_days_grid"])
+            * len(params["model_kind_grid"])
+            * len(params["calibration_grid"])
+        )
+    elif preset == "balanced":
+        horizons_grid = st.multiselect("Горизонты прогноза (дней)", [30, 60, 90], default=[30]) or [30]
+        default_history = {30: 180, 60: 180, 90: 365}[int(horizons_grid[0])]
+        metric_key = st.selectbox(
+            "Метрика выбора лучшей модели",
+            options=list(METRIC_LABELS.keys()),
+            format_func=lambda k: METRIC_LABELS.get(k, k),
+            index=0,
+        )
+        balanced_models = ["lightgbm", "catboost", "logreg", "random_forest", "sklearn_gbdt"]
+        selected_models_display = [format_model_kind(m) for m in balanced_models]
+        history_grid = [int(default_history)]
+        steps_grid = [30]
+        with st.expander("Тонкая настройка", expanded=False):
+            history_grid = st.multiselect("Окна истории", [90, 180, 365], default=history_grid) or history_grid
+            steps_grid = st.multiselect("Шаги точки отсчёта", [14, 30], default=steps_grid) or steps_grid
             calibration_grid = st.multiselect("Калибровка", ["sigmoid", "isotonic"], default=["sigmoid"]) or ["sigmoid"]
         params = {
             "mode": "compare",
             "model_name": model_name.strip(),
-            "horizon_days_grid": [int(horizon)],
+            "horizon_days_grid": [int(x) for x in horizons_grid],
             "history_days_grid": [int(x) for x in history_grid],
-            "step_days_grid": [int(step_days)],
-            "model_kind_grid": ["lightgbm", "catboost", "logreg"],
+            "step_days_grid": [int(x) for x in steps_grid],
+            "model_kind_grid": balanced_models,
             "selection_metric": metric_key,
             "calibration_grid": calibration_grid,
-            "min_events_in_history": int(min_events_in_history),
+            "min_events_in_history": 1,
             "enable_shap": bool(enable_shap),
             "extra_feature_cols": state.extra_feature_cols or [],
             "extra_feature_config": state.extra_feature_config or {},
@@ -211,7 +217,6 @@ def page():
         ) or [m for m in model_defaults if m in model_options]
         with st.expander("Тонкая настройка", expanded=False):
             calibration_grid = st.multiselect("Калибровка", ["sigmoid", "isotonic"], default=["sigmoid"]) or ["sigmoid"]
-            min_events_in_history = st.selectbox("Минимум событий в истории", [1, 2, 3], index=0)
 
         if "mlp" in selected_models:
             st.warning(
@@ -231,7 +236,7 @@ def page():
             "model_kind_grid": [str(x) for x in selected_models],
             "selection_metric": metric_key,
             "calibration_grid": calibration_grid,
-            "min_events_in_history": int(min_events_in_history),
+            "min_events_in_history": 1,
             "enable_shap": bool(enable_shap),
             "extra_feature_cols": state.extra_feature_cols or [],
             "extra_feature_config": state.extra_feature_config or {},
@@ -298,12 +303,14 @@ def page():
 
     if status.get("status") == "done":
         st.success("Обучение завершено. Перейдите к шагу «Качество и сравнение».")
-        try:
-            state.job_result = api.job_result(state.job_id)
-        except Exception as e:
-            st.error(f"Не удалось загрузить итог: {e}")
-            page_nav(STEP_2_ANALYTICS, STEP_4_QUALITY, next_disabled_reason="Сначала дождитесь корректного завершения обучения.")
-            return
+        if state.job_result is None or st.session_state.get("_loaded_job_result_id") != state.job_id:
+            try:
+                state.job_result = api.job_result(state.job_id)
+                st.session_state["_loaded_job_result_id"] = state.job_id
+            except Exception as e:
+                st.error(f"Не удалось загрузить итог: {e}")
+                page_nav(STEP_2_ANALYTICS, STEP_4_QUALITY, next_disabled_reason="Сначала дождитесь корректного завершения обучения.")
+                return
 
         result = state.job_result or {}
         saved_params = result.get("params_used") or {}
@@ -327,9 +334,9 @@ def page():
                 if sm:
                     st.write(f"**Метрика выбора лучшего:** {METRIC_LABELS.get(str(sm), sm)}")
             try:
-                report_bytes = api.download_job_report(state.job_id)
+                report_bytes = _download_job_report_cached(api.base_url, state.job_id)
                 st.download_button(
-                    "Скачать архив с отчётами",
+                    "Скачать отчет по обучению zip",
                     data=report_bytes,
                     file_name=f"report_{state.job_id[:8]}.zip",
                     mime="application/zip",

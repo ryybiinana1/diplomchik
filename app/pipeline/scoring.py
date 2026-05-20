@@ -10,6 +10,7 @@ from app.pipeline.bundle import compare_input_to_schema, load_model_bundle
 from app.pipeline.features import prepare_feature_matrix
 from churnlib.data_module import SnapshotConfig, build_latest_snapshot, canonicalize_types
 from churnlib.economy_module import build_scenarios, expected_value, profit_curve_from_ev, scenario_from_params, best_k
+from churnlib.report_module import write_scoring_html_report
 from churnlib.validation_module import basic_validate
 
 
@@ -285,6 +286,33 @@ def run_scoring_pipeline(
         scenario_df.to_csv(scenario_path, index=False)
         scenario_priority_csvs[scenario_name] = str(scenario_path)
 
+    score_report_info = {}
+    try:
+        score_report_info = write_scoring_html_report(
+            out_path=str(out / "score_report.html"),
+            model_info={
+                "model_name": params.get("model_name"),
+                "template": template,
+                "model_kind": params.get("model_kind"),
+                "horizon_days": params.get("horizon_days"),
+            },
+            n_scored=int(len(scored)),
+            business_summary={
+                **business_summary,
+                "scenario_comment": (
+                    f"В базовом сценарии рекомендовано начать с top-{best_k_base} клиентов: "
+                    "это максимизирует ожидаемый экономический эффект при текущих допущениях."
+                    if best_k_base
+                    else "Положительный эффект есть у части клиентов, но ширину кампании лучше выбрать после просмотра scenario_summary.csv."
+                ),
+            },
+            scenario_rows=scenario_rows,
+            top_clients_preview=priority_df.head(25).fillna("").to_dict(orient="records"),
+            score_mapping=score_mapping,
+        )
+    except Exception:
+        score_report_info = {}
+
     return {
         "template": template,
         "bundle_dir": bundle_dir,
@@ -292,6 +320,7 @@ def run_scoring_pipeline(
         "priority_csv": str(priority_csv),
         "scenario_priority_csvs": scenario_priority_csvs,
         "scenario_summary_csv": str(summary_csv),
+        "score_report_html": score_report_info.get("html_path"),
         "n_scored": int(len(scored)),
         "schema_check": schema_check,
         "score_mapping": score_mapping,

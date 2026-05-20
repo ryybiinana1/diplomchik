@@ -35,6 +35,7 @@ TRAINING_STAGE_LABELS = {
     "profiling_and_validation": "Проверка структуры данных",
     "experiment_grid": "Подготовка сценариев обучения",
     "grid_search": "Перебор вариантов модели",
+    "best_model_interpretation": "Интерпретация лучшей модели",
     "finalizing_artifacts": "Сохранение отчётов и модели",
     "starting": "Запуск",
     "done": "Готово",

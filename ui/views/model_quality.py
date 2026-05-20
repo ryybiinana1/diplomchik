@@ -191,7 +191,13 @@ def page():
 
             if rows:
                 edf = pd.DataFrame(rows)
-                metrics_df = edf["test_metrics_cal"].apply(_parse_metrics_blob).apply(pd.Series) if "test_metrics_cal" in edf.columns else pd.DataFrame()
+                metrics_df = (
+                    edf["test_metrics_cal"].apply(_parse_metrics_blob).apply(pd.Series)
+                    if "test_metrics_cal" in edf.columns
+                    else pd.DataFrame()
+                )
+                if not metrics_df.empty:
+                    metrics_df = metrics_df[[c for c in metrics_df.columns if c not in edf.columns]]
                 comparison_df = pd.concat([edf.reset_index(drop=True), metrics_df.reset_index(drop=True)], axis=1)
                 if "model_kind" in comparison_df.columns:
                     comparison_df["model_kind_label"] = comparison_df["model_kind"].map(format_model_kind)

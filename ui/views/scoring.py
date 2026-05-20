@@ -523,6 +523,8 @@ def page():
     )
     reverse_mapping = {v: k for k, v in mapping_from_training.items() if v}
     suggested_mapping = _smart_score_mapping(expected_cols, actual_cols, mapping_from_training, inspect_payload)
+    if expected_cols and not state.score_column_mapping:
+        state.score_column_mapping = suggested_mapping.copy()
 
     with section_card(
         "Сопоставление колонок",
@@ -549,6 +551,22 @@ def page():
             st.warning(f"Не удалось получить серверные подсказки для автосопоставления: {inspect_error}")
 
         if expected_cols:
+            etalon_rows = []
+            required_cols = set(training_schema.get("required_source_columns") or [])
+            for source_col in expected_cols:
+                role = reverse_mapping.get(source_col)
+                role_title = (role_meta.get(role, {}) or {}).get("title") if role else ""
+                etalon_rows.append(
+                    {
+                        "Эталонная колонка (обучение)": source_col,
+                        "Роль": role_title or role or "Доп. признак",
+                        "Обязательная": "Да" if source_col in required_cols else "Нет",
+                        "Автоподбор": suggested_mapping.get(source_col, "—"),
+                    }
+                )
+            st.markdown("#### Эталонные колонки выбранной модели")
+            st.dataframe(pd.DataFrame(etalon_rows), width="stretch", hide_index=True)
+
             with st.form("score_mapping_form"):
                 next_mapping: dict[str, str] = {}
                 st.markdown('<p class="ui-form-block-title">Колонки, использованные при обучении</p>', unsafe_allow_html=True)
@@ -758,6 +776,18 @@ def page():
                     )
                 except Exception as e:
                     dl2.warning(f"Не удалось подготовить scenario summary: {e}")
+
+                try:
+                    score_report_bytes = api.download_score_artifact(state.score_id, "score_report.html")
+                    st.download_button(
+                        label="Скачать единый отчёт по прогнозу (HTML)",
+                        data=score_report_bytes,
+                        file_name="score_report.html",
+                        mime="text/html",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.warning(f"Не удалось подготовить единый отчёт по прогнозу: {e}")
 
                 st.markdown("#### Списки клиентов по сценариям")
                 scenario_cols = st.columns(3)

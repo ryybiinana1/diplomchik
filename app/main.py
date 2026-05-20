@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-import shutil
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -46,13 +46,32 @@ def _resolve_allowed_bundle_dir(bundle_dir: str) -> Path:
     return resolved
 
 
-def _dir_tree_max_mtime(root: Path) -> float:
+def _build_training_export_zip(artifacts_dir: Path, zip_path: Path) -> None:
+    """
+    Формирует архив для пользователя: только DOCX-отчёт и веса моделей.
+    """
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in artifacts_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() == ".docx" and path.name != "training_report.docx":
+                continue
+            if path.suffix.lower() not in {".docx", ".joblib"}:
+                continue
+            arcname = path.relative_to(artifacts_dir)
+            zf.write(path, arcname=str(arcname))
+
+
+def _training_export_mtime(artifacts_dir: Path) -> float:
     mt = 0.0
-    if not root.exists():
-        return mt
-    for path in root.rglob("*"):
-        if path.is_file():
-            mt = max(mt, path.stat().st_mtime)
+    for path in artifacts_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() == ".docx" and path.name != "training_report.docx":
+            continue
+        if path.suffix.lower() not in {".docx", ".joblib"}:
+            continue
+        mt = max(mt, path.stat().st_mtime)
     return mt
 
 
@@ -276,12 +295,9 @@ def download(job_id: str):
         raise HTTPException(status_code=404, detail="No artifacts")
 
     zip_path = job_dir / "report.zip"
-    artifacts_mtime = _dir_tree_max_mtime(artifacts)
-    need_archive = True
-    if zip_path.exists() and artifacts_mtime <= zip_path.stat().st_mtime:
-        need_archive = False
-    if need_archive:
-        shutil.make_archive(str(zip_path).replace(".zip", ""), "zip", artifacts)
+    artifacts_mtime = _training_export_mtime(artifacts)
+    if not zip_path.exists() or zip_path.stat().st_mtime < artifacts_mtime:
+        _build_training_export_zip(artifacts, zip_path)
     return FileResponse(zip_path, filename="report.zip")
 
 
